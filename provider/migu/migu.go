@@ -6,17 +6,17 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/base"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/base"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
-	"github.com/cnsilvan/UnblockNeteaseMusic/network"
-	"github.com/cnsilvan/UnblockNeteaseMusic/processor/crypto"
-	"github.com/cnsilvan/UnblockNeteaseMusic/utils"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/network"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/processor/crypto"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
 )
 
 type Migu struct{}

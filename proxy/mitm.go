@@ -39,7 +39,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/config"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/config"
 )
 
 var (

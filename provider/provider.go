@@ -4,22 +4,22 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/cache"
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
-	"github.com/cnsilvan/UnblockNeteaseMusic/network"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/base"
-	kugou "github.com/cnsilvan/UnblockNeteaseMusic/provider/kugou"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/kuwo"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/migu"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/pyncmd"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider/qq"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/cache"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/network"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/base"
+	kugou "github.com/mzkingk-ai/UnblockNeteaseMusic/provider/kugou"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/kuwo"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/migu"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/pyncmd"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/qq"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/utils"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
 )
 
 type Provider interface {

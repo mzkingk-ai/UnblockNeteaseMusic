@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 )
 
 // 缓存在路由器上必须有上限：内存只有 128～256MB，sync.Map 只增不减，

@@ -3,7 +3,7 @@ package base
 import (
 	"testing"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 )
 
 // 用真机上抓到的实际案例做回归：

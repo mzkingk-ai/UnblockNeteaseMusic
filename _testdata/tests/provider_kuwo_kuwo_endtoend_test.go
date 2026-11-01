@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 )
 
 // 这段是 2026-10-31 从酷我 PC 搜索接口实际抓下来的「晴天 周杰伦」原始响应片段，

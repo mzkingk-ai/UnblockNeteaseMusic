@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
-	"github.com/cnsilvan/UnblockNeteaseMusic/network"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/network"
 )
 
 // kuwoMaxScan 是每条搜索结果里最多看多少条。上游是 min(len/2+1,5)，

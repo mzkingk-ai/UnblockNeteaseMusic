@@ -1,5 +1,5 @@
 CurrentVersion=0.2.13
-Project=github.com/cnsilvan/UnblockNeteaseMusic
+Project=github.com/mzkingk-ai/UnblockNeteaseMusic
 Path="$Project/version"
 ExecName="UnblockNeteaseMusic"
 GitCommit=$(git rev-parse --short HEAD || echo unsupported)

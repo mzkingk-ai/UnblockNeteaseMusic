@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
-	"github.com/cnsilvan/UnblockNeteaseMusic/config"
-	"github.com/cnsilvan/UnblockNeteaseMusic/network"
-	"github.com/cnsilvan/UnblockNeteaseMusic/processor"
-	"github.com/cnsilvan/UnblockNeteaseMusic/version"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/config"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/network"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/processor"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/version"
 )
 
 type HttpHandler struct{}

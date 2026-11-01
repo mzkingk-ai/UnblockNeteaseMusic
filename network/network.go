@@ -3,7 +3,7 @@ package network
 import (
 	"bytes"
 	"crypto/tls"
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 	"io"
 	"io/ioutil"
 	"log"
@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/utils"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
 )
 
 var (

@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/common"
-	"github.com/cnsilvan/UnblockNeteaseMusic/utils"
-	"github.com/cnsilvan/UnblockNeteaseMusic/version"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/version"
 )
 
 var (

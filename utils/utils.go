@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/cnsilvan/UnblockNeteaseMusic/cookiestxt"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/cookiestxt"
 	"golang.org/x/text/unicode/norm"
 	"io"
 	"io/ioutil"

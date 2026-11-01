@@ -8,15 +8,15 @@ import (
 	"runtime/debug"
 	"syscall"
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/config"
-	"github.com/cnsilvan/UnblockNeteaseMusic/provider"
-	"github.com/cnsilvan/UnblockNeteaseMusic/version"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/config"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/version"
 
 	//_ "github.com/mkevac/debugcharts" // 可选，添加后可以查看几个实时图表数据
 	//_ "net/http/pprof" // 必须，引入 pprof 模块
 
-	"github.com/cnsilvan/UnblockNeteaseMusic/host"
-	"github.com/cnsilvan/UnblockNeteaseMusic/proxy"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/host"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/proxy"
 )
 
 func main() {
