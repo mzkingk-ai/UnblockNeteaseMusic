@@ -2,9 +2,11 @@ package base
 
 import (
 	"errors"
+	"fmt"
 	"github.com/cnsilvan/UnblockNeteaseMusic/common"
 	"github.com/cnsilvan/UnblockNeteaseMusic/network"
 	"github.com/cnsilvan/UnblockNeteaseMusic/utils"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -58,6 +60,15 @@ func CalScore(song common.SearchSong, songName string, singerName string, index 
 		if len(songName) > 0 {
 			songNameSores = utils.CalMatchScoresV2(song.Name, songName, "songName")
 		}
+		// 歌名必须命中。CalMatchScoresV2 是按「长度更长的那个」来算分母的，
+		// 当一个极短的候选名（如「晴天」）恰好完整出现在很长的目标歌名里时，
+		// 仅靠歌名就能拿到接近满分，歌手也对不上也照样入选。
+		// 此处显式要求歌名必须高度命中：短候选名完全嵌在长目标名里
+		// （「晴天」vs「晴天 周杰伦」）时，0.5 的门槛仍不足以区分
+		// 「晴天 (KTV版伴奏)」（0.29）这种擦边结果，直接抬到 0.7。
+		if songNameSores < 0.7 && len(songName) > 0 {
+			return 0, false
+		}
 		var artistsNameSores float32 = 0.0
 		if len(singerName) > 0 {
 			singerName = strings.ReplaceAll(singerName, "&", "、")
@@ -79,4 +90,27 @@ func AfterSearchSong(song common.SearchSong, songs []*common.Song) []*common.Son
 		songs = songs[:song.Limit]
 	}
 	return songs
+}
+
+// FilterByScore 是「别放错歌」的闸：CalScore 只给分不设下限，各 provider 的
+// ParseSong 又会无条件取搜索结果第一条，于是原唱无版权时会静默播放同名翻唱。
+// 阈值 common.MinMatchScore 设为 0 表示关闭过滤（恢复上游行为）。
+// 放在 base 包是因为 kuwo/kugou 等 provider 都要用，而它们不能被 provider 包反向引用。
+func FilterByScore(songs []*common.Song) []*common.Song {
+	if common.MinMatchScore <= 0 || len(songs) == 0 {
+		return songs
+	}
+	kept := make([]*common.Song, 0, len(songs))
+	for _, song := range songs {
+		if song == nil {
+			continue
+		}
+		if song.MatchScore >= common.MinMatchScore {
+			kept = append(kept, song)
+		} else {
+			log.Println(fmt.Sprintf("reject low score %.2f < %.2f: %s - %s [%s]",
+				song.MatchScore, common.MinMatchScore, song.Artist, song.Name, song.Source))
+		}
+	}
+	return kept
 }

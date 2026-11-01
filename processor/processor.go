@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -86,6 +87,16 @@ type Netease struct {
 	SearchSongs    []*common.Song
 }
 
+// hasApiPrefix 判断路径是不是网易云的标准 API 前缀。
+// 上游只认 /weapi/ 和 /api/ 两种，于是 iOS 版客户端的 /xeapi/... 一条都进不来，
+// 播放地址永远原样透传（实测 iOS 全部请求都是 xeapi）。
+// /weapi/ 会被下面 normalize 成 /api/，/xeapi/ 同理。
+func hasApiPrefix(path string) bool {
+	return strings.Index(path, "/weapi/") == 0 ||
+		strings.Index(path, "/api/") == 0 ||
+		strings.Index(path, "/xeapi/") == 0
+}
+
 func RequestBefore(request *http.Request) *Netease {
 	netease := &Netease{Path: request.URL.Path}
 
@@ -121,20 +132,51 @@ func RequestBefore(request *http.Request) *Netease {
 			}
 		} else if len(requestBody) > 7 {
 			requestBodyH := make([]byte, len(requestBody))
-			length, _ := hex.Decode(requestBodyH, requestBody[7:len(requestBody)-len(pad)])
-			decryptECBBytes, _ := crypto.AesDecryptECB(requestBodyH[:length], []byte(eApiKey))
-			decryptString := string(decryptECBBytes)
-			data := strings.Split(decryptString, "-36cd479b6b5-")
-			netease.Path = data[0]
-			netease.Params = utils.ParseJson(bytes.NewBufferString(data[1]).Bytes())
+			length, err := hex.Decode(requestBodyH, requestBody[7:len(requestBody)-len(pad)])
+			if err != nil || length == 0 {
+				// 请求体不是合法的 eapi 密文（比如调试时漏了长度前缀）：保留原
+				// Path 原样转发，别让后面 data[1] 越界把整个请求打成空响应。
+				log.Printf("eapi body decode fail(%s) len=%d err=%v\n", netease.Path, len(requestBody), err)
+			} else {
+				decryptECBBytes, _ := crypto.AesDecryptECB(requestBodyH[:length], []byte(eApiKey))
+				decryptString := string(decryptECBBytes)
+				data := strings.Split(decryptString, "-36cd479b6b5-")
+				if len(data) >= 2 {
+					netease.Path = data[0]
+					netease.Params = utils.ParseJson(bytes.NewBufferString(data[1]).Bytes())
+				} else {
+					log.Printf("eapi body decrypt fail(%s): %q\n", netease.Path, decryptString)
+				}
+			}
 		}
 		netease.Path = strings.ReplaceAll(netease.Path, "https://music.163.com", "")
 		netease.Path = strings.ReplaceAll(netease.Path, "http://music.163.com", "")
+		// 解出来的明文路径同样可能带前缀（/xeapi/ 是 iOS 的新写法），统一归一化。
+		netease.Path = utils.ReplaceAll(netease.Path, `^\/eapi\/`, "/api/")
+		netease.Path = utils.ReplaceAll(netease.Path, `^\/weapi\/`, "/api/")
+		netease.Path = utils.ReplaceAll(netease.Path, `^\/xeapi\/`, "/api/")
 		netease.Path = utils.ReplaceAll(netease.Path, `\/\d*$`, "")
-	} else if strings.Index(netease.Path, "/weapi/") == 0 || strings.Index(netease.Path, "/api/") == 0 {
+	} else if hasApiPrefix(netease.Path) {
 		request.Header.Set("X-Real-IP", "118.66.66.66")
 		netease.Web = true
+		// 普通 /api/ GET 的码率等参数全在 query 里，而这条路原来不解析 Params，
+		// 导致 unifiedMusicQuality 永远读到空 map、拿默认的 Lossless 去取歌：
+		// pyncmd 会回一份 37MB 的 flac，手机要 128k 也照给，路由器白白转发几十兆。
+		// 注意 netease.Path 在 RequestBefore 开头就是 request.URL.Path（不含 query），
+		// 所以必须从 request.URL.Query() 取，不能对 Path 做 url.Parse。
+		if rawQuery := request.URL.RawQuery; len(rawQuery) > 0 {
+			q := common.MapType{}
+			for k, v := range request.URL.Query() {
+				if len(v) > 0 {
+					q[k] = v[0]
+				}
+			}
+			if len(q) > 0 {
+				netease.Params = q
+			}
+		}
 		netease.Path = utils.ReplaceAll(netease.Path, `^\/weapi\/`, "/api/")
+		netease.Path = utils.ReplaceAll(netease.Path, `^\/xeapi\/`, "/api/")
 		netease.Path = utils.ReplaceAll(netease.Path, `\?.+$`, "")
 		netease.Path = utils.ReplaceAll(netease.Path, `\/\d*$`, "")
 	} else if strings.Contains(netease.Path, "package") {
@@ -720,35 +762,57 @@ func unifiedMusicQuality(netease *Netease) {
 	// log.Println(fmt.Sprintf("%+v\n", utils.ToJson(netease.Params)))
 	netease.MusicQuality = common.Lossless
 	if !*config.ForceBestQuality {
-		if levelParam, ok := netease.Params["level"]; ok {
-			if level, ok := levelParam.(string); ok {
-				level = strings.ToLower(level)
-				if strings.Contains(level, "lossless") {
-					netease.MusicQuality = common.Lossless
-				} else if strings.Contains(level, "exhigh") {
-					netease.MusicQuality = common.ExHigh
-				} else if strings.Contains(level, "higher") {
-					netease.MusicQuality = common.Higher
-				} else if strings.Contains(level, "standard") {
-					netease.MusicQuality = common.Standard
-				}
-			}
-		} else if brParam, ok := netease.Params["br"]; ok {
-			if br, ok := brParam.(string); ok {
-				br = strings.ToLower(br)
-				if strings.Contains(br, "999000") {
-					netease.MusicQuality = common.Lossless
-				} else if strings.Contains(br, "320000") {
-					netease.MusicQuality = common.ExHigh
-				} else if strings.Contains(br, "192000") {
-					netease.MusicQuality = common.Higher
-				} else if strings.Contains(br, "128000") {
-					netease.MusicQuality = common.Standard
-				}
-			}
+		// 上游这里写的是 if level { ... } else if br { ... }，
+		// 但网易客户端的取址请求同时带 level 和 br，level 分支一命中 br 就永远读不到，
+		// 而 level 只是客户端的档位标记、并不等于实际要的码率（实测 level=standard
+		// 配 br=320000 时网易自己回的就是 320k）。所以这里改成两者独立判断、br 优先：
+		// br 是数字型，必须用 fmt.Sprint 抹平类型，否则 strconv 断言失败会一路跌回 Lossless。
+		level := ""
+		if v, ok := netease.Params["level"].(string); ok {
+			level = strings.ToLower(v)
+		}
+		br := ""
+		if v, ok := netease.Params["br"]; ok {
+			br = strings.ToLower(fmt.Sprint(v))
+		}
+		switch {
+		case isLosslessRate(br):
+			netease.MusicQuality = common.Lossless
+		case isExHighRate(br):
+			netease.MusicQuality = common.ExHigh
+		case isHigherRate(br):
+			netease.MusicQuality = common.Higher
+		case isStandardRate(br):
+			netease.MusicQuality = common.Standard
+		case strings.Contains(level, "lossless"):
+			netease.MusicQuality = common.Lossless
+		case strings.Contains(level, "exhigh"):
+			netease.MusicQuality = common.ExHigh
+		case strings.Contains(level, "higher"):
+			netease.MusicQuality = common.Higher
+		case strings.Contains(level, "standard"):
+			netease.MusicQuality = common.Standard
 		}
 		// log.Println(fmt.Sprintf("%+v\n", utils.ToJson(netease.MusicQuality)))
 	}
+}
+
+// 下面四个函数把 br 的各种写法（128000 / 128 / "128k"）归到同一档。
+// 用前缀匹配而不是 Contains：客户端偶发传 "br=320000,999000" 这类组合值。
+func isLosslessRate(br string) bool {
+	return strings.HasPrefix(br, "999") || strings.HasPrefix(br, "1999") || strings.HasPrefix(br, "1411")
+}
+
+func isExHighRate(br string) bool {
+	return strings.HasPrefix(br, "320")
+}
+
+func isHigherRate(br string) bool {
+	return strings.HasPrefix(br, "192")
+}
+
+func isStandardRate(br string) bool {
+	return strings.HasPrefix(br, "128")
 }
 func generateEndpoint(netease *Netease) string {
 	protocol := "https"

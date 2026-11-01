@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -38,9 +39,18 @@ func init() {
 	directClient = &http.Client{
 		Transport: tr.Clone(),
 	}
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	// 重要：InsecureSkipVerify 必须挂在**独立的一份** Transport 上。
+	// 原先直接写在 tr 上再传进 httpClient，而 directClient 是 tr.Clone() ——
+	// Clone 会复制当时的 TLSClientConfig，顺序先后决定谁跳校验，极易看漏。
+	// 独立出来之后语义明确：
+	//   directClient —— 直连音源/第三方 API，自己控制目标，不校验证书可接受；
+	//   httpClient   —— 转发客户端发往网易的请求，**不**跳过校验。
+	// 不跳过是必须的：serveProxy 把 Host 改写成真实 IP 后 TLS 的 SNI 也变成 IP，
+	// 而网易证书没有 IP SAN，跳过校验时又报
+	//   x509: cannot validate certificate for 220.197.30.67
+	// 两条路都跑不通。正确做法见 Request：转发 IP 目标时显式指定 ServerName。
 	httpClient = &http.Client{
-		Transport: tr,
+		Transport: tr.Clone(),
 	}
 
 }
@@ -55,6 +65,16 @@ type ClientRequest struct {
 	Cookies              []*http.Cookie
 	Proxy                bool
 	ConnectTimeout       time.Duration
+	// ResponseHeaderTimeout 覆盖全局的 5s 响应头超时。
+	// 全局值是按 kuwo/kugou 这类快音源定的；pyncmd（第三方 API）实测
+	// 要 4.5~9.4s 才回响应头，5s 会被反复截断并触发重试，结果在 6s 的
+	// 并发窗口里一次都拿不到。0 表示沿用全局默认。
+	ResponseHeaderTimeout time.Duration
+	// HTTPProxy 显式指定本次请求走的代理，形如 "http://127.0.0.1:7890"。
+	// 空串表示沿用默认（http.ProxyFromEnvironment，即看 HTTP_PROXY/HTTPS_PROXY）。
+	// 用于「直连失败后改走本地代理再试一次」：不改环境变量（那会影响所有请求），
+	// 只对这一条请求生效。
+	HTTPProxy string
 }
 
 func Request(clientRequest *ClientRequest) (*http.Response, error) {
@@ -140,8 +160,67 @@ func Request(clientRequest *ClientRequest) (*http.Response, error) {
 	request.Header.Set("accept-language", acceptLanguage)
 	request.Header.Set("user-agent", userAgent)
 	client := directClient
-	if _, ok := common.HostDomain[request.Host]; ok {
+	// 判断走哪个 client 看的是「目标地址」而不是 Host 头：serveProxy 把
+	// 网易域名换成了真实 IP 转发，Host 头这时是 IP，用原逻辑
+	// common.HostDomain[request.Host] 永远查不到，直接落到 directClient。
+	targetHost := request.URL.Hostname()
+	_, isNetease := common.HostDomain[targetHost]
+	if !isNetease {
+		// 目标已换成 IP 时按 IP 反查回域名，再判一次
+		if name := common.HostNameOf(targetHost); len(name) > 0 {
+			targetHost = name
+			isNetease = true
+		} else if _, ok := common.HostDomain[request.Host]; ok {
+			targetHost = request.Host
+			isNetease = true
+		}
+	}
+	if isNetease {
 		client = httpClient
+		// 目标是 IP 时 TLS 的 SNI 会跟着变成那个 IP，而网易证书只有 DNS SAN，
+		// 必须显式把 ServerName 指回原域名，否则报
+		//   x509: cannot validate certificate for 220.197.30.67
+		// 注意 Host 头不受影响，仍是调用方设定的值。
+		if tr, ok := client.Transport.(*http.Transport); ok && net.ParseIP(targetHost) == nil {
+			t2 := tr.Clone()
+			tn := t2.TLSClientConfig
+			if tn == nil {
+				tn = &tls.Config{}
+			} else {
+				tn = tn.Clone()
+			}
+			if net.ParseIP(request.URL.Hostname()) != nil {
+				tn.ServerName = targetHost
+			}
+			t2.TLSClientConfig = tn
+			client = &http.Client{Transport: t2}
+		}
+	}
+
+	// 需要更长的响应头超时（pyncmd 这类慢接口）或指定代理时，克隆一份 client
+	// 换掉 Transport，不改全局配置 —— kuwo/kugou 等快音源仍按原超时/直连，
+	// 避免被慢接口或代理拖累。
+	// 两个覆盖项合并成一次 Clone：分两次写会互相覆盖（第二次拿的还是原 Transport）。
+	if clientRequest.ResponseHeaderTimeout > 0 || clientRequest.HTTPProxy != "" {
+		if tr, ok := client.Transport.(*http.Transport); ok {
+			t2 := tr.Clone()
+			if clientRequest.ResponseHeaderTimeout > 0 {
+				t2.ResponseHeaderTimeout = clientRequest.ResponseHeaderTimeout
+			}
+			if clientRequest.HTTPProxy != "" {
+				if pu, err := url.Parse(clientRequest.HTTPProxy); err == nil {
+					t2.Proxy = http.ProxyURL(pu)
+					// ForceAttemptHTTP2 必须保持 true（默认值），别关。
+					// 实测关掉后代理在 CONNECT 隧道里直接发 h2 帧（\x00\x00\x12\x04...），
+					// 而 Go 按 HTTP/1.x 解析明文响应，报
+					//   malformed HTTP response "\x00\x00\x12\x04..."
+					// 每次请求都失败。保持 true 时 Go 会走 h2 客户端，正常。
+				} else {
+					log.Println("invalid HTTPProxy:", clientRequest.HTTPProxy, err)
+				}
+			}
+			client = &http.Client{Transport: t2}
+		}
 	}
 	// }
 	resp, err = client.Do(request)

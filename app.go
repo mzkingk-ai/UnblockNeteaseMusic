@@ -67,8 +67,11 @@ func main() {
 				exit <- true
 			}()
 			signal.Notify(signalChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGSEGV, syscall.SIGKILL)
-			proxy.InitProxy()
+			// provider.Init() 必须早于 InitProxy()：InitProxy 最后一步是
+			// 同步阻塞的 startServer()，放它后面 provider 表就永远是空的，
+			// 所有解锁请求都会静默返回空结果（实测消耗 6 秒超时后 code=404）。
 			provider.Init()
+			proxy.InitProxy()
 			<-exit
 			log.Println("exiting UnblockNeteaseMusic")
 		}

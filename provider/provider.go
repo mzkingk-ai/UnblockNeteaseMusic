@@ -7,9 +7,11 @@ import (
 	"github.com/cnsilvan/UnblockNeteaseMusic/cache"
 	"github.com/cnsilvan/UnblockNeteaseMusic/common"
 	"github.com/cnsilvan/UnblockNeteaseMusic/network"
+	"github.com/cnsilvan/UnblockNeteaseMusic/provider/base"
 	kugou "github.com/cnsilvan/UnblockNeteaseMusic/provider/kugou"
 	"github.com/cnsilvan/UnblockNeteaseMusic/provider/kuwo"
 	"github.com/cnsilvan/UnblockNeteaseMusic/provider/migu"
+	"github.com/cnsilvan/UnblockNeteaseMusic/provider/pyncmd"
 	"github.com/cnsilvan/UnblockNeteaseMusic/provider/qq"
 	"net/http"
 	"net/url"
@@ -34,6 +36,20 @@ func Init() {
 	for _, source := range common.Source {
 		providers[source] = NewProvider(source)
 	}
+	if len(providers) == 0 {
+		// 兜底：正常路径下 common.Source 一定非空，但只要它是空的，
+		// 上面的并发搜索就一个源都不会发出去，最终只会静默返回空结果。
+		providers["kuwo"] = NewProvider("kuwo")
+	}
+	log.Printf("providers=%v\n", keysOf(providers))
+}
+
+func keysOf(m map[string]Provider) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }
 func NewProvider(kind string) Provider {
 	switch kind {
@@ -45,7 +61,10 @@ func NewProvider(kind string) Provider {
 		return &migu.Migu{}
 	case "qq":
 		return &qq.QQ{}
+	case "pyncmd":
+		return &pyncmd.PyNcmd{}
 	default:
+		// 未知音源退回酷我，保持上游行为不变。
 		return &kuwo.KuWo{}
 	}
 }
@@ -160,9 +179,34 @@ func Find(music common.SearchMusic) common.Song {
 			//}
 			searchSong["artistsName"] = strings.Join(artists, " ")
 			searchSong["artistList"] = artists
-			searchSong["keyword"] = searchSong["name"].(string) + " " + searchSong["artistsName"].(string)
+			// 网易在某些歌曲/未登录环境下会返回「结构完整但内容全 null」的详情
+			// （实测 id=34930257：name/artists/album 都是 null）。此时对 name
+			// 直接做 .(string) 会 panic: interface conversion: interface {} is nil,
+			// not string —— 被 proxy 的 recover 接住，表现为这一次请求返回 0 字节。
+			// 没有元数据就做不了歌名匹配，但 pyncmd 只需要 songId，所以这里降级：
+			// keyword 留空、跳过换源搜索，只走 pyncmd。
+			songName, _ := searchSong["name"].(string)
+			artistsName, _ := searchSong["artistsName"].(string)
+			searchSong["keyword"] = strings.TrimSpace(songName + " " + artistsName)
+			if len(searchSong["keyword"].(string)) == 0 {
+				log.Println("song meta empty, fallback to songId only: " + songT.Id)
+				base := &common.Song{Id: songT.Id}
+				if py := GetProvider("pyncmd").GetSongUrl(common.SearchMusic{Id: songT.Id, Quality: music.Quality}, base); py != nil && len(py.Url) > 0 {
+					py = calculateSongInfo(py)
+					cache.PutSong(music, py)
+					log.Println(utils.ToJson(*py))
+					return *py
+				}
+				return songT
+			}
 			log.Println("search song:" + searchSong["keyword"].(string))
-			songT = *parseSongFn(searchSong, music)
+			// pyncmd 与换源搜索放进同一个并发窗口一起跑：
+			//   pyncmd 不需要歌名匹配，直接拿网易 songId 换地址，拿回来的就是
+			//   这首歌本身（实测 md5 与网易原址一致），不存在猜原唱/翻唱风险，
+			//   所以有结果就优先用它；但它走公网第三方接口，最坏要 3 次 × 8 秒
+			//   重试，排在前面串行跑会把整首解析拖到 25 秒以上。改为同时发出，
+			//   由 resolveSong 统一收口。
+			songT = *resolveSong(searchSong, music)
 			log.Println(utils.ToJson(songT))
 			return songT
 
@@ -174,39 +218,139 @@ func Find(music common.SearchMusic) common.Song {
 	}
 }
 
-func parseSongFn(key common.MapType, music common.SearchMusic) *common.Song {
+// findFromPyNcmd 用网易 songId 走 pyncmd 拿直链。
+//
+// 这不是「换源」，而是「同一首歌换一条不校验 VIP 的取址通道」，所以：
+//   - 不需要歌名/歌手匹配，MatchScore 直接给 1.0；
+//   - 不需要过 MinMatchScore 阈值；
+//   - 拿回来的码率/大小就是网易那份文件的真实值。
+//
+// key 里必须有 songId（由 Find 从 /api/song/detail 的响应里填进来）；
+// 取不到就返回空，交给换源搜索兜底。
+func findFromPyNcmd(key common.MapType, music common.SearchMusic) *common.Song {
+	empty := &common.Song{}
+	songId, ok := key["songId"].(string)
+	if !ok || len(songId) == 0 {
+		return empty
+	}
+	now := time.Now()
+	base := &common.Song{Id: songId}
+	// key["name"] 在元数据缺失时可能是 nil（网易返回 name:null），
+	// 直接 .(string) 会 panic，这里用带 ok 的断言。
+	if v, ok := key["name"].(string); ok {
+		base.Name = v
+	}
+	if v, ok := key["artistsName"].(string); ok {
+		base.Artist = v
+	}
+	if v, ok := key["album"].(common.MapType); ok {
+		if name, ok := v["name"].(string); ok {
+			base.AlbumName = name
+		}
+	}
+	re := GetProvider("pyncmd").GetSongUrl(common.SearchMusic{Id: songId, Quality: music.Quality}, base)
+	log.Println("pyncmd consumed:", time.Since(now))
+	if re == nil || len(re.Url) == 0 {
+		// pyncmd 没有这首歌：不写缓存，让换源搜索照常进行。
+		return empty
+	}
+	re = calculateSongInfo(re)
+	// pyncmd 拿到的是「同一首网易歌的直链」，缓存键不带平台前缀，
+	// 否则下一次同一首歌再进来时命中不了（GetSong 用的是原始 music）。
+	cache.PutSong(music, re)
+	return re
+}
+
+// resolveSong 把 pyncmd 和所有换源放进同一个并发窗口，统一收口。
+//
+// 之前的写法是先串行跑 pyncmd、没结果再进 getSongFromAllSource 的 6 秒窗口，
+// 于是「pyncmd 慢」会直接叠在换源耗时之上：pyncmd 内部是最多 3 次 × 8 秒
+// 的重试，最坏能把一次播放请求拖到 25 秒以上，而换源那边其实几百毫秒就
+// 已经有结果了。现在两边同时发出：
+//   - pyncmd 有结果就用它（它给的是网易原曲，不用猜原唱）；
+//   - 否则用换源里 MatchScore 最高、同分取体积大的那条（与老逻辑一致）。
+//
+// resolveResult 区分结果来自 pyncmd 还是换源，避免靠 MatchScore==1 猜。
+type resolveResult struct {
+	song   *common.Song
+	fromPy bool
+}
+
+func resolveSong(key common.MapType, music common.SearchMusic) *common.Song {
+	now := time.Now()
+	ch := make(chan resolveResult)
+	pending := 0 // 换源剩余未返回数
+
+	// pyncmd 走独立通道：它不参与 MatchScore 比较，也不计入 pending。
+	go utils.PanicWrapper(func() {
+		ch <- resolveResult{song: findFromPyNcmd(key, music), fromPy: true}
+	})
+
+	for _, p := range providers {
+		pt := p
+		go utils.PanicWrapper(func() {
+			ch <- resolveResult{song: calculateSongInfo(pt.ParseSong(buildSearchSong(key, music)))}
+		})
+		pending++
+	}
+
+	songs := make([]*common.Song, 0, pending)
+	var py *common.Song
+	// 定时器必须在循环外建：写在 select 里会每轮重新计时，
+	// 收到一条消息就把 deadline 往后推，实测能拖到 14.9s 才超时。
+	//
+	// 窗口 20s：这是按「无代理直连」的最坏情况定的（实测会挂到 17.9s）。
+	// 有代理时 pyncmd 自己 6s 就返回，窗口大小不影响实际耗时 ——
+	// 换源全返回且已有结果就提前收工，pyncmd 先回来也会立刻返回。
+	// 只有「换源全废 + 直连 pyncmd 慢」这一种情况才真会等满。
+	timeout := time.NewTimer(time.Second * 20)
+	defer timeout.Stop()
+	for {
+		select {
+		case r := <-ch:
+			s := r.song
+			if !r.fromPy {
+				pending--
+			}
+			if s != nil && len(s.Url) > 0 {
+				if r.fromPy {
+					py = s
+					// pyncmd 给的是网易原曲，优先级最高，拿到就能收工。
+					return pickSong(py, FilterByScore(songs), key, music)
+				}
+				songs = append(songs, s)
+			}
+			// 换源已有可用结果，且换源都返回了 → 不必再陪慢的 pyncmd 等。
+			if pending <= 0 && len(songs) > 0 {
+				return pickSong(py, FilterByScore(songs), key, music)
+			}
+		case <-timeout.C:
+			// 超时后不再等剩下的音源，但已经到的结果仍然可用。
+			log.Println("resolve timeout, got:", time.Since(now))
+			return pickSong(py, FilterByScore(songs), key, music)
+		}
+	}
+}
+
+// pickSong 在 pyncmd 结果与换源结果之间做最终选择。
+func pickSong(py *common.Song, songs []*common.Song, key common.MapType, music common.SearchMusic) *common.Song {
+	if py != nil {
+		log.Println("resolved by pyncmd:", utils.ToJson(py))
+		return py
+	}
 	id := "0"
-	searchSongName := key["name"].(string)
-	searchSongName = strings.ToUpper(searchSongName)
-	searchArtistsName := key["artistsName"].(string)
-	searchArtistsName = strings.ToUpper(searchArtistsName)
-	searchKeyword := key["keyword"].(string)
 	if songId, ok := key["songId"]; ok {
 		id = songId.(string)
 	}
-	searchArtistList := key["artistList"].([]string)
-	key["musicQuality"] = music.Quality
-	var ch = make(chan *common.Song)
-	now := time.Now()
-	searchSong := common.SearchSong{
-		Keyword: searchKeyword, Name: searchSongName,
-		ArtistsName: searchArtistsName, Quality: music.Quality,
-		OrderBy: common.MatchedScoreDesc, Limit: 1,
-		ArtistList: searchArtistList,
-	}
-	songs := getSongFromAllSource(searchSong, ch)
-	log.Println("consumed:", time.Since(now))
 	result := &common.Song{}
 	result.Size = 0
 	for _, song := range songs {
-
 		if song.MatchScore > result.MatchScore {
 			result = song
 		} else if song.MatchScore == result.MatchScore && song.Size > result.Size {
 			result = song
 		}
 	}
-
 	if id != "0" {
 		result.Id = id
 		if len(result.Url) > 0 {
@@ -215,33 +359,31 @@ func parseSongFn(key common.MapType, music common.SearchMusic) *common.Song {
 		}
 	}
 	return result
-
 }
 
-func getSongFromAllSource(key common.SearchSong, ch chan *common.Song) []*common.Song {
-	var songs []*common.Song
-	sum := 0
-	for _, p := range providers {
-		pt := p
-		go utils.PanicWrapper(func() {
-			ch <- calculateSongInfo(pt.ParseSong(key))
-		})
-		sum++
+// buildSearchSong 由 Find 组装好的 key 生成换源搜索参数（大写的歌名/歌手）。
+func buildSearchSong(key common.MapType, music common.SearchMusic) common.SearchSong {
+	searchKeyword, _ := key["keyword"].(string)
+	artistList, _ := key["artistList"].([]string)
+	// 这里原本有一行 key["musicQuality"] = music.Quality。它写进去的值从来没被读过
+	// （下面的 Quality 字段直接用 music.Quality），却让 resolveSong 里所有音源的
+	// goroutine 并发写同一个 map —— Go 对并发写 map 是 fatal error，进程当场退出，
+	// 而且 recover 抓不住。单音源时只有一个 goroutine 写，所以以前没暴露；
+	// 改成多音源（pyncmd+kuwo+kugou+migu）后每次播放必崩。删掉即可。
+	return common.SearchSong{
+		Keyword:     searchKeyword,
+		Name:        strings.ToUpper(key["name"].(string)),
+		ArtistsName: strings.ToUpper(key["artistsName"].(string)),
+		Quality:     music.Quality,
+		OrderBy:     common.MatchedScoreDesc,
+		Limit:       1,
+		ArtistList:  artistList,
 	}
-	for {
-		select {
-		case song, _ := <-ch:
-			if len(song.Url) > 0 {
-				songs = append(songs, song)
-			}
-			sum--
-			if sum <= 0 {
-				return songs
-			}
-		case <-time.After(time.Second * 6):
-			return songs
-		}
-	}
+}
+
+// FilterByScore 委托给 base 包，保持调用方签名不变。
+func FilterByScore(songs []*common.Song) []*common.Song {
+	return base.FilterByScore(songs)
 }
 
 func SearchSongFromAllSource(key common.SearchSong) []*common.Song {
@@ -261,10 +403,10 @@ func SearchSongFromAllSource(key common.SearchSong) []*common.Song {
 			songs = append(songs, song...)
 			sum--
 			if sum <= 0 {
-				return songs
+				return FilterByScore(songs)
 			}
 		case <-time.After(time.Second * 6):
-			return songs
+			return FilterByScore(songs)
 		}
 	}
 }
