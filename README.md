@@ -21,7 +21,8 @@ pyncmd 等音源搜一个能播的版本，把播放地址换掉再返回。
 
 | 设备 | 文件 |
 |---|---|
-| MT7621 / Padavan 等 MIPS 小端软浮点 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
+| **MT7621 / Padavan 等 MIPS 小端软浮点（推荐）** | `UnblockNeteaseMusic-linux-mipsle-softfloat-mt7621.zip` |
+| 其它 MIPS 小端软浮点设备 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
 | 其它 MIPS 小端 | `UnblockNeteaseMusic-linux-mipsle.zip` |
 | MIPS 大端 | `UnblockNeteaseMusic-linux-mips.zip` / `-softfloat` |
 | ARM 路由器（armv7 及以上） | `UnblockNeteaseMusic-linux-arm7.zip`，更老的用 `arm6` / `arm5` |
@@ -29,11 +30,14 @@ pyncmd 等音源搜一个能播的版本，把播放地址换掉再返回。
 | x86_64 PC / 软路由 / NAS | `UnblockNeteaseMusic-linux-amd64.zip` |
 | Windows / macOS | `UnblockNeteaseMusic-windows-amd64.zip` / `darwin-arm64`、`darwin-amd64` |
 
-拿不准路由器是哪个就先用 `mipsle-softfloat`；跑不起来再换 `mipsle`，
+MT7621 专用的那个包和通用 `mipsle-softfloat` 是同一份代码、同样跑得起来，
+差别只是名字里点明了设备、去掉了 Go build id（对体积几乎没影响，差 200 字节左右），
+以及构建时多一道「必须是 MIPS 小端 ELF」和「upx 压完能自解压」的检查。
+拿不准路由器是哪个就先用带 `mt7621` 的；跑不起来再换 `mipsle`，
 报 `exec format error` 说明是大端，换 `mips`。
 
 ```sh
-unzip UnblockNeteaseMusic-linux-mipsle-softfloat.zip -d /opt/unm
+unzip UnblockNeteaseMusic-linux-mipsle-softfloat-mt7621.zip -d /opt/unm
 chmod +x /opt/unm/UnblockNeteaseMusic
 ```
 
@@ -248,7 +252,7 @@ curl -k "https://music.163.com/api/search/get/web?csrf_token=&s=test&type=1&offs
 | 音源 | 新增 `pyncmd`；酷我改走 PC 接口解析（`provider/kuwo/pcparse.go`） |
 | 路由与解锁链路 | 音质选档、翻唱阈值、证书失败不退出、eapi 容错、provider 初始化顺序等 |
 | 多源稳定性 | 修掉并发写 map 崩溃；pyncmd 改为并发竞速，不再被全局 5 秒响应头超时误杀 |
-| 自动发布 | 推送到 `master` 后，如果相比上一个 release 有新提交，自动构建 14 个平台并发布 |
+| 自动发布 | 推送到 `master` 后，如果相比上一个 release 有新提交，自动构建 15 个平台产物并发布 |
 
 ### 路由器上的硬约束
 
@@ -300,6 +304,8 @@ gh workflow run auto_release.yml -f version=1.0.0      # 指定版本号
 
 构建统一固定 go1.22（见上面的硬约束）。所有二进制在打包前用 `upx --lzma --best` 压缩
 （路由器 flash 小，能省不少空间），macOS 的除外——upx 会破坏 Mach-O 签名。
+MT7621 的那个包额外带两道检查：打包前先确认产物是 ELF32 小端、`e_machine` 是 MIPS，
+压完再用 `upx -t` 解一遍验壳，任何一道不对就整个 job 失败，避免发出一个上机跑不起来的包。
 Release 附带 `SHA256SUMS`，校验：`sha256sum -c SHA256SUMS --ignore-missing`。
 
 ## 致谢

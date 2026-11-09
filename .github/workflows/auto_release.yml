@@ -202,6 +202,9 @@ jobs:
           - { name: linux-mips, goos: linux, goarch: mips }
           - { name: linux-mipsle-softfloat, goos: linux, goarch: mipsle, gomips: softfloat, suffix: "-softfloat" }
           - { name: linux-mips-softfloat, goos: linux, goarch: mips, gomips: softfloat, suffix: "-softfloat" }
+          # MT7621 专用：和 linux-mipsle-softfloat 同一份代码，只是单独命名、去掉 Go build id，
+          # 好处是路由器用户不用再猜该下哪个包，并且在打包前多一道 MIPS 小端 ELF 校验。
+          - { name: linux-mipsle-softfloat-mt7621, goos: linux, goarch: mipsle, gomips: softfloat, suffix: "-softfloat-mt7621", mt7621: true, nobuildid: true }
     steps:
       - name: 检出
         uses: actions/checkout@v4
@@ -233,6 +236,7 @@ jobs:
           GOMIPS_T: ${{ matrix.gomips }}
           SUFFIX_T: ${{ matrix.suffix }}
           EXT_T: ${{ matrix.ext }}
+          NOBUILDID_T: ${{ matrix.nobuildid }}
         run: |
           set -euo pipefail
           out="dist/${{ matrix.name }}"
@@ -257,6 +261,10 @@ jobs:
           ldflags="$ldflags -X '${PROJECT}/version.ExGoVersionInfo=${SUFFIX_T}'"
 
           echo "==> 编译 ${GOOS}/${GOARCH}${SUFFIX_T} (GOARM=${GOARM:-} GOMIPS=${GOMIPS:-})"
+          # -buildid= 只给 MT7621 包用（它是链接器参数，必须写进 ldflags，不能当 go build 的参数）。
+          # 实测对 upx 后体积几乎没有影响（7.4MB 的 mipsle 产物只少 200 字节左右），
+          # 所以这只是「路由器包不需要 build id」的顺手取舍，不是省空间的主力。
+          if [ "${NOBUILDID_T}" = "true" ]; then ldflags="$ldflags -buildid="; fi
           go build -trimpath -ldflags "$ldflags" -o "$out/$bin" .
           file "$out/$bin" || true
 
@@ -267,22 +275,43 @@ jobs:
           GOOS_T: ${{ matrix.goos }}
           GOARCH_T: ${{ matrix.goarch }}
           UPX_T: ${{ matrix.upx }}
+          MT7621_T: ${{ matrix.mt7621 }}
         run: |
           set -euo pipefail
           out="dist/${{ matrix.name }}"
           bin="${EXEC_NAME}${EXT_T}"
 
+          # MT7621 包先验一遍：必须是 MIPS 小端 ELF。上机 exec format error 远程排查太贵，
+          # 在这里失败比发布一个跑不起来的包好。
+          # 直接读 ELF 头字节：不用 readelf —— 它的输出会跟着 locale 变（中文环境印「小端序」），
+          # grep 'LSB' 这种写法在非英文 runner 上会误判。
+          #   offset 0..5 = 7f 45 4c 46 01 01 → ELF32 + little endian
+          #   offset 18..19 = 08 00          → e_machine = 8 (EM_MIPS)
+          if [ "${MT7621_T}" = "true" ]; then
+            magic="$(od -An -tx1 -N6 "$out/$bin" | tr -d ' \n')"
+            machine="$(od -An -tx1 -j18 -N2 "$out/$bin" | tr -d ' \n')"
+            [ "$magic" = "7f454c460101" ] || { echo "::error::MT7621 包不是 ELF32 小端（header=$magic）"; exit 1; }
+            [ "$machine" = "0800" ] || { echo "::error::MT7621 包不是 MIPS（e_machine=$machine）"; exit 1; }
+            echo "==> MT7621 包校验通过：ELF32 / little endian / EM_MIPS"
+          fi
+
           # macOS 上 upx 会破坏二进制签名（Apple Silicon 直接被杀掉），不压
           if [ "${UPX_T}" != "false" ]; then
             if command -v upx >/dev/null 2>&1; then
+              before=$(stat -c%s "$out/$bin")
               upx --lzma --best "$out/$bin" || upx --best "$out/$bin" || echo "::warning::upx 压缩失败，保留未压缩二进制"
+              echo "==> upx: ${before} -> $(stat -c%s "$out/$bin") 字节"
+              # upx -t 会完整解一遍并比对，确认壳压完还能自解压
+              upx -t "$out/$bin" || { echo "::error::upx 自检失败：压缩后的二进制解不开"; exit 1; }
+            else
+              echo "::warning::runner 上没有 upx，本次未压缩"
             fi
           fi
 
           cp certs/ca.crt certs/server.crt certs/server.key certs/createCertificate.sh "$out"/
 
           zipname="${EXEC_NAME}-${GOOS_T}-${GOARCH_T}${SUFFIX_T}.zip"
-          ( cd "$out" && zip -j -q -r "$zipname" "$bin" ca.crt server.crt server.key createCertificate.sh )
+          ( cd "$out" && zip -9 -j -q -r "$zipname" "$bin" ca.crt server.crt server.key createCertificate.sh )
           cp "$out/$zipname" "dist/$zipname"
           ls -lh "dist/$zipname"
 
@@ -340,7 +369,8 @@ jobs:
 
             | 设备 | 文件 |
             |---|---|
-            | MT7621 / Padavan 等 MIPS 小端软浮点路由器 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
+            | **MT7621 / Padavan 等 MIPS 小端软浮点路由器（推荐）** | `UnblockNeteaseMusic-linux-mipsle-softfloat-mt7621.zip` |
+            | 其它 MIPS 小端软浮点设备 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
             | 其它 MIPS 小端路由器 | `UnblockNeteaseMusic-linux-mipsle.zip` |
             | MIPS 大端路由器 | `UnblockNeteaseMusic-linux-mips.zip` / `-softfloat` |
             | ARM 路由器（armv7 及以上） | `UnblockNeteaseMusic-linux-arm7.zip`，更老的用 `arm6` / `arm5` |
@@ -350,10 +380,14 @@ jobs:
             | macOS | `UnblockNeteaseMusic-darwin-arm64.zip`（Apple Silicon）/ `darwin-amd64`（Intel） |
 
             每个 zip 内含可执行文件、`ca.crt`、`server.crt`、`server.key` 和 `createCertificate.sh`。
+            除 macOS 外，包内的可执行文件都经过 `upx --lzma --best` 压缩（约压到 24%）；
+            `mt7621` 那个包额外去掉了 Go build id。解压后都是同样的 MIPS32 小端 softfloat 静态 ELF。
             建议自己跑 `./createCertificate.sh` 重新生成证书，而不使用包内自带的。
 
             ### 路由器提示
 
             1. 用 **go1.22** 编译（本构建已固定）；go1.23+ 的产物在 MT7621 + uClibc 上会一启动就 SIGSEGV。
-            2. MT7621 必须用 `linux-mipsle-softfloat`。
-            3. 校验：`sha256sum -c SHA256SUMS --ignore-missing`。
+            2. MT7621 用 `linux-mipsle-softfloat-mt7621`；名字里没有 `mt7621` 的通用 softfloat 构建同样能跑。
+            3. upx 的壳是在内存里自解压的（不需要 `/tmp` 可写），但要求内核允许 RWX 映射；
+               极少数 hardened 内核会拒绝，此时 `upx -d` 解压一次，或直接用 `linux-mipsle-softfloat.zip` 里的包。
+            4. 校验：`sha256sum -c SHA256SUMS --ignore-missing`。
