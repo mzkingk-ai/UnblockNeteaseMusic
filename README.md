@@ -17,6 +17,7 @@
 | 音源 | 新增 `pyncmd`；酷我改走 PC 接口解析（`provider/kuwo/pcparse.go`） |
 | 路由与解锁链路 | 音质选档、翻唱阈值、证书失败不退出、eapi 容错、provider 初始化顺序等 |
 | 多源稳定性 | 修掉并发写 map 崩溃；pyncmd 改为并发竞速，不再被全局 5 秒响应头超时误杀 |
+| 自动发布 | 推送到 `master` 后，如果相比上一个 release 有新提交，自动构建 14 个平台并发布 |
 
 ### 路由器上的硬约束
 
@@ -44,6 +45,43 @@ GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0 \
 ```
 
 脚本会把测试临时复制回各自的包目录，跑完自动删除。
+
+## 自动发布
+
+[`.github/workflows/auto_release.yml`](.github/workflows/auto_release.yml) 负责构建与发布：
+
+| 触发 | 行为 |
+|---|---|
+| 推送到 `master` | 若相比上一个 release 有新提交，构建全部平台并发布新版本；没有新提交则直接跳过 |
+| 手动运行（Actions 页面 *Run workflow* / `gh workflow run`） | 可选「强制发布」和「手动指定版本号」 |
+
+版本号在「上一个 release 的 tag」上递增 patch（找不到 release 时依次回退到本地 tag、
+上游 `cnsilvan/UnblockNeteaseMusic` 的最后一个 release、文件里的 `FALLBACK_BASE`）。
+所以正常情况下第一次运行会产出 `0.2.14`。想用别的号，手动运行并填 `version` 即可。
+
+手动运行：
+
+```sh
+gh workflow run auto_release.yml                       # 有新提交才发布
+gh workflow run auto_release.yml -f force=true         # 强制发一版
+gh workflow run auto_release.yml -f version=1.0.0      # 指定版本号
+```
+
+构建统一固定 go1.22（见上面的硬约束），产物覆盖 PC、服务器、树莓派、群晖和常见路由器：
+
+| 设备 | 文件 |
+|---|---|
+| MT7621 / Padavan 等 MIPS 小端软浮点 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
+| 其它 MIPS 小端 | `UnblockNeteaseMusic-linux-mipsle.zip` |
+| MIPS 大端 | `UnblockNeteaseMusic-linux-mips.zip` / `-softfloat` |
+| ARM 路由器（armv7 及以上） | `UnblockNeteaseMusic-linux-arm7.zip`，更老的用 `arm6` / `arm5` |
+| 树莓派 / 群晖 / ARM64 服务器 | `UnblockNeteaseMusic-linux-arm64.zip` |
+| x86_64 PC / 软路由 / NAS | `UnblockNeteaseMusic-linux-amd64.zip` |
+| Windows / macOS | `windows-amd64` / `darwin-arm64`、`darwin-amd64` |
+
+每个 zip 里是可执行文件、`ca.crt`、`server.crt`、`server.key` 和 `createCertificate.sh`；
+CA 私钥不打包。所有二进制在打包前用 `upx --lzma --best` 压缩（路由器 flash 小，能省不少空间），
+macOS 的除外——upx 会破坏 Mach-O 签名。Release 附带 `SHA256SUMS`。
 
 ## 上游原版说明（以下为上游内容）
 

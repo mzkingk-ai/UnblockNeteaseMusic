@@ -1,126 +1,359 @@
-name: release Unblockneteasemusic
+name: Build & Release
+
+# 触发方式
+#   1. 推送到 master：如果相比上一个 release 有新的提交，就构建全部平台并发布新版本；
+#      没有新提交则直接跳过（不会刷空 release）。
+#   2. 手动运行（Actions 页面 "Run workflow" 或 gh workflow run）：
+#      可选「强制发布」和「指定版本号」。
 on:
   push:
-    tags:
-      - "0*"
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "即使相比上一个 release 没有新提交也构建并发布"
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: "手动指定版本号（如 0.2.10）；留空则在上一个版本上自动递增 patch"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+# 同一分支上不并发跑发布，避免两个任务抢同一个 tag
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # 必须固定 1.22：go1.23+ 的 runtime 在 MT7621 + uClibc 上 futex 返回 -89，产物一启动就 SIGSEGV
+  GO_VERSION: "1.22.x"
+  PROJECT: github.com/mzkingk-ai/UnblockNeteaseMusic
+  EXEC_NAME: UnblockNeteaseMusic
+  # 版本号基线来源：本仓库没有 release/tag 时，用上游最后一个发布版本来接着递增
+  UPSTREAM_REPO: cnsilvan/UnblockNeteaseMusic
+  FALLBACK_BASE: "0.2.13"
+
 jobs:
-  build_luci:
+  # ---------------------------------------------------------------- 判断是否需要发布
+  check:
+    name: 检查新提交
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      previous: ${{ steps.decide.outputs.previous }}
+      commits: ${{ steps.decide.outputs.commits }}
+      changelog: ${{ steps.decide.outputs.changelog }}
+    steps:
+      - name: 检出（需要完整历史与 tag 才能算差异）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 决定版本号与是否构建
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          semver_tags() {
+            git tag -l | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true
+          }
+
+          # 版本基线依次尝试：本仓库最近的 release → 本地 tag → 上游最近的 release → 内置兜底
+          prev="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          src="本仓库 release"
+          if [ -z "$prev" ]; then
+            prev="$(semver_tags | tail -1)"
+            src="本地 tag"
+          fi
+          if [ -z "$prev" ]; then
+            prev="$(gh release view --repo "$UPSTREAM_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+            src="上游 release"
+          fi
+          if [ -z "$prev" ]; then
+            prev="$FALLBACK_BASE"
+            src="内置兜底"
+            echo "::warning::没有找到任何 release 或 tag，使用内置基线 ${FALLBACK_BASE}"
+          fi
+          echo "上一个版本: ${prev}（来源：${src}）"
+
+          # 基线 tag 本地可能不存在（比如来自上游），按需拉取，才能算准提交差异
+          if ! git rev-parse -q --verify "refs/tags/${prev}^{commit}" >/dev/null 2>&1; then
+            echo "本地没有 tag ${prev}，尝试拉取"
+            git fetch -q --no-tags "https://github.com/${UPSTREAM_REPO}.git" "+refs/tags/${prev}:refs/tags/${prev}" 2>/dev/null \
+              || git fetch -q --no-tags origin "+refs/tags/${prev}:refs/tags/${prev}" 2>/dev/null || true
+          fi
+
+          has_prev=false
+          if git rev-parse -q --verify "refs/tags/${prev}^{commit}" >/dev/null 2>&1; then
+            has_prev=true
+            commits="$(git rev-list --count "${prev}..HEAD")"
+          else
+            commits="$(git rev-list --count HEAD)"
+          fi
+          echo "自上一个版本以来的提交数: ${commits}"
+
+          skip=false
+          if [ "$commits" -eq 0 ] && [ "${INPUT_FORCE:-false}" != "true" ]; then
+            echo "没有新提交，跳过构建与发布。"
+            skip=true
+          fi
+
+          # 版本号：手动指定 > 基线 +1 patch
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+          else
+            bare="${prev#v}"
+            major="${bare%%.*}"
+            rest="${bare#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            version="${major}.${minor}.$((patch + 1))"
+          fi
+          echo "本次版本号: ${version}"
+
+          # 变更日志
+          if [ "$has_prev" = true ]; then
+            changelog="$(git log -50 --pretty=format:'- %s（%h）' "${prev}..HEAD")"
+          else
+            changelog="$(git log -30 --pretty=format:'- %s（%h）')"
+          fi
+          if [ -z "$changelog" ]; then
+            changelog="- 无新提交"
+          fi
+
+          {
+            echo "skip=${skip}"
+            echo "version=${version}"
+            echo "tag=${version}"
+            echo "previous=${prev}"
+            echo "commits=${commits}"
+            echo "changelog<<__CHANGELOG_EOF__"
+            echo "${changelog}"
+            echo "__CHANGELOG_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- 生成一套证书供所有平台共用
+  prepare:
+    name: 生成证书
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
-        uses: actions/checkout@v2
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 生成 CA 与服务器证书
+        run: |
+          set -euo pipefail
+          mkdir -p certs
+          cp createCertificate.sh certs/
+          cd certs
+          bash ./createCertificate.sh
+          # ca.key / ca.srl / server.csr 不进发布包，避免把 CA 私钥发出去
+          rm -f ca.key ca.srl server.csr extFile.txt
+          ls -l
+
+      - name: 上传证书
+        uses: actions/upload-artifact@v4
         with:
-          ref: master
-          fetch-depth: 0
-          lfs: true
-      - name: set git identity
+          name: certs
+          path: certs
+          retention-days: 1
+
+  # ---------------------------------------------------------------- 各平台构建
+  build:
+    name: ${{ matrix.name }}
+    needs: [check, prepare]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖常见设备：PC、服务器、树莓派、群晖、以及 MT7621 等 MIPS/ARM 路由器
+        include:
+          - { name: windows-amd64, goos: windows, goarch: amd64, ext: ".exe" }
+          - { name: darwin-amd64, goos: darwin, goarch: amd64, upx: false }
+          - { name: darwin-arm64, goos: darwin, goarch: arm64, upx: false }
+          - { name: linux-amd64, goos: linux, goarch: amd64 }
+          - { name: linux-386, goos: linux, goarch: "386" }
+          - { name: linux-arm64, goos: linux, goarch: arm64 }
+          - { name: linux-arm, goos: linux, goarch: arm }
+          - { name: linux-arm5, goos: linux, goarch: arm, goarm: "5", suffix: "5" }
+          - { name: linux-arm6, goos: linux, goarch: arm, goarm: "6", suffix: "6" }
+          - { name: linux-arm7, goos: linux, goarch: arm, goarm: "7", suffix: "7" }
+          - { name: linux-mipsle, goos: linux, goarch: mipsle }
+          - { name: linux-mips, goos: linux, goarch: mips }
+          - { name: linux-mipsle-softfloat, goos: linux, goarch: mipsle, gomips: softfloat, suffix: "-softfloat" }
+          - { name: linux-mips-softfloat, goos: linux, goarch: mips, gomips: softfloat, suffix: "-softfloat" }
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 upx（路由器 flash 很小，压缩后的二进制能省下不少空间）
         run: |
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-      - name: init environment
-        run: |
-          sudo -E apt-get -y install upx
-      - name: Set up Go 1.x
-        uses: actions/setup-go@v2
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq upx || sudo apt-get install -y -qq upx-ucl || echo "::warning::upx 安装失败，本次不压缩"
+          upx --version | head -1 || true
+
+      - name: 准备 Go
+        uses: actions/setup-go@v5
         with:
-          go-version: ^1.16
-        id: go
-      - name: get dependencies
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: 取回证书
+        uses: actions/download-artifact@v4
+        with:
+          name: certs
+          path: certs
+
+      - name: 编译
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          GOOS_T: ${{ matrix.goos }}
+          GOARCH_T: ${{ matrix.goarch }}
+          GOARM_T: ${{ matrix.goarm }}
+          GOMIPS_T: ${{ matrix.gomips }}
+          SUFFIX_T: ${{ matrix.suffix }}
+          EXT_T: ${{ matrix.ext }}
         run: |
-          go get -v -t -d ./...
-          if [ -f Gopkg.toml ]; then
-             curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-             dep ensure
+          set -euo pipefail
+          out="dist/${{ matrix.name }}"
+          mkdir -p "$out"
+          bin="${EXEC_NAME}${EXT_T}"
+
+          export GOOS="$GOOS_T"
+          export GOARCH="$GOARCH_T"
+          export CGO_ENABLED=0
+          if [ -n "${GOARM_T}" ]; then export GOARM="$GOARM_T"; fi
+          if [ -n "${GOMIPS_T}" ]; then export GOMIPS="$GOMIPS_T"; fi
+
+          short_sha="$(git rev-parse --short HEAD)"
+          build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          go_version="$(go env GOVERSION)"
+
+          ldflags="-s -w"
+          ldflags="$ldflags -X '${PROJECT}/version.Version=${VERSION}'"
+          ldflags="$ldflags -X '${PROJECT}/version.GitCommit=${short_sha}'"
+          ldflags="$ldflags -X '${PROJECT}/version.GoVersion=${go_version}'"
+          ldflags="$ldflags -X '${PROJECT}/version.BuildTime=${build_time}'"
+          ldflags="$ldflags -X '${PROJECT}/version.ExGoVersionInfo=${SUFFIX_T}'"
+
+          echo "==> 编译 ${GOOS}/${GOARCH}${SUFFIX_T} (GOARM=${GOARM:-} GOMIPS=${GOMIPS:-})"
+          go build -trimpath -ldflags "$ldflags" -o "$out/$bin" .
+          file "$out/$bin" || true
+
+      - name: 打包
+        env:
+          EXT_T: ${{ matrix.ext }}
+          SUFFIX_T: ${{ matrix.suffix }}
+          GOOS_T: ${{ matrix.goos }}
+          GOARCH_T: ${{ matrix.goarch }}
+          UPX_T: ${{ matrix.upx }}
+        run: |
+          set -euo pipefail
+          out="dist/${{ matrix.name }}"
+          bin="${EXEC_NAME}${EXT_T}"
+
+          # macOS 上 upx 会破坏二进制签名（Apple Silicon 直接被杀掉），不压
+          if [ "${UPX_T}" != "false" ]; then
+            if command -v upx >/dev/null 2>&1; then
+              upx --lzma --best "$out/$bin" || upx --best "$out/$bin" || echo "::warning::upx 压缩失败，保留未压缩二进制"
+            fi
           fi
-      - name: build
-        run: |
-          CurrentVersion=${{ github.ref }}
-          CurrentVersion=${CurrentVersion/'refs/tags/'/''}
-          Project=github.com/cnsilvan/UnblockNeteaseMusic
-          Path="$Project/version"
-          ExecName="UnblockNeteaseMusic"
-          GitCommit=$(git rev-parse --short HEAD || echo unsupported)
-          GoVersion=$(go version)
-          BuildTime=$(TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S")
-          platforms=("windows/amd64" "darwin/amd64" "darwin/arm64" "linux/amd64" "linux/arm5" "linux/arm"  "linux/arm7" "linux/arm64" "linux/mipsle" "linux/mips" "linux/mipsle-softfloat" "linux/mips-softfloat" "linux/386")
-          buildGo() {
-           GOOS=$1
-           GOARCH=$2
-           CGO="CGO_ENABLED=0"
-           GOARM=""
-           GOMIPS=""
-           output_name=$ExecName
-           suffix=""
-           TargetDir=bin/$GOOS/$GOARCH
-           if [ $GOOS = "windows" ]; then
-             output_name+='.exe'
-           fi
-           if [ $GOOS = "ios" ]; then
-             CGO="CGO_ENABLED=1 CC=$(go env GOROOT)/misc/ios/clangwrap.sh"
-           fi
-           if [ $GOARCH = "arm5" ]; then
-               GOARCH="arm"
-               GOARM="GOARM=5"
-               suffix="5"
-           elif [ $GOARCH = "arm64" ]; then
-               GOARCH="arm64"
-               GOARM=""
-               suffix=""
-           elif [ $GOARCH = "arm7" ]; then
-               GOARCH="arm"
-               GOARM="GOARM=7"
-               suffix="7"
-           fi
-           if [ $GOARCH = "mipsle-softfloat" ]; then
-               GOARCH="mipsle"
-               GOMIPS="GOMIPS=softfloat"
-               suffix="-softfloat"
-           elif [ $GOARCH = "mips-softfloat" ]; then
-               GOARCH="mips"
-               GOMIPS="GOMIPS=softfloat"
-               suffix="-softfloat"
-           fi
-           echo "Building($GOOS/$GOARCH$suffix)..."
-           echo $GOMIPS $GOARM
-           env $GOARM $GOMIPS GOOS=$GOOS GOARCH=$GOARCH $CGO env GOPROXY=https://goproxy.io go build -ldflags "-X '$Path.Version=$CurrentVersion' -X '$Path.BuildTime=$BuildTime' -X '$Path.GoVersion=$GoVersion' -X '$Path.GitCommit=$GitCommit' -X '$Path.ExGoVersionInfo=$suffix' -w -s" -o $TargetDir/$output_name
-           if [ $? -ne 0 ]; then
-              echo 'An error has occurred! Aborting the script execution...'
-              exit 1
-           fi
-           echo "Upxing..."
-           upx --lzma --best $TargetDir/$output_name
-           cp -rf key/ca.crt $TargetDir/
-           cp -rf key/server.key $TargetDir/
-           cp -rf key/server.crt $TargetDir/
-           cp -rf key/createCertificate.sh $TargetDir/
-           ZipName=$ExecName"-"$GOOS"-"$GOARCH"$suffix"
-           zip -j -q -r  $TargetDir/$ZipName.zip $TargetDir
-           cp $TargetDir/$ZipName.zip bin/releaseUpload/
-          }
-          rm -rf bin/
-          mkdir -p bin/releaseUpload
-          mkdir -p key
-          cp ./createCertificate.sh key
-          cd key
-          ./createCertificate.sh
-          cd ..
-          for platform in "${platforms[@]}"; do
-           platform_split=(${platform//\// })
-           buildGo ${platform_split[0]} ${platform_split[1]}
-          done
-          echo "--------------------------------------------"
-          echo "Version:" $CurrentVersion
-          echo "Git commit:" $GitCommit
-          echo "Go version:" $GoVersion
-          echo "Build Time:" $BuildTime
-          echo "Build Finish"
-          echo "--------------------------------------------"
-      - name: create release and upload asset
-        uses: svenstaro/upload-release-action@v2
+
+          cp certs/ca.crt certs/server.crt certs/server.key certs/createCertificate.sh "$out"/
+
+          zipname="${EXEC_NAME}-${GOOS_T}-${GOARCH_T}${SUFFIX_T}.zip"
+          ( cd "$out" && zip -j -q -r "$zipname" "$bin" ca.crt server.crt server.key createCertificate.sh )
+          cp "$out/$zipname" "dist/$zipname"
+          ls -lh "dist/$zipname"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: bin/releaseUpload/*
-          file_glob: true
-          tag: ${{ github.ref }}
-          overwrite: true
-          body: "[bot] automatically publish packages compiled with the latest source code"
+          name: assets-${{ matrix.name }}
+          path: dist/*.zip
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: 发布 ${{ needs.check.outputs.version }}
+    needs: [check, build]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取回全部产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -lh
+          sha256sum ./*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ${{ needs.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+          body: |
+            ## UnblockNeteaseMusic ${{ needs.check.outputs.version }}
+
+            自动构建，源码提交 `${{ github.sha }}`。
+            ${{ needs.check.outputs.commits }} 个新提交，相较上个版本 `${{ needs.check.outputs.previous }}`。
+
+            ### 变更
+            ${{ needs.check.outputs.changelog }}
+
+            ### 下载哪个
+
+            | 设备 | 文件 |
+            |---|---|
+            | MT7621 / Padavan 等 MIPS 小端软浮点路由器 | `UnblockNeteaseMusic-linux-mipsle-softfloat.zip` |
+            | 其它 MIPS 小端路由器 | `UnblockNeteaseMusic-linux-mipsle.zip` |
+            | MIPS 大端路由器 | `UnblockNeteaseMusic-linux-mips.zip` / `-softfloat` |
+            | ARM 路由器（armv7 及以上） | `UnblockNeteaseMusic-linux-arm7.zip`，更老的用 `arm6` / `arm5` |
+            | 树莓派 / 群晖 / ARM64 服务器 | `UnblockNeteaseMusic-linux-arm64.zip` |
+            | x86_64 PC / 软路由 / NAS | `UnblockNeteaseMusic-linux-amd64.zip` |
+            | Windows | `UnblockNeteaseMusic-windows-amd64.zip` |
+            | macOS | `UnblockNeteaseMusic-darwin-arm64.zip`（Apple Silicon）/ `darwin-amd64`（Intel） |
+
+            每个 zip 内含可执行文件、`ca.crt`、`server.crt`、`server.key` 和 `createCertificate.sh`。
+            建议自己跑 `./createCertificate.sh` 重新生成证书，而不使用包内自带的。
+
+            ### 路由器提示
+
+            1. 用 **go1.22** 编译（本构建已固定）；go1.23+ 的产物在 MT7621 + uClibc 上会一启动就 SIGSEGV。
+            2. MT7621 必须用 `linux-mipsle-softfloat`。
+            3. 校验：`sha256sum -c SHA256SUMS --ignore-missing`。
