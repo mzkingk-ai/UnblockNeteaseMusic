@@ -242,6 +242,18 @@ curl -k "https://music.163.com/api/search/get/web?csrf_token=&s=test&type=1&offs
 新版客户端可能对接口域名做了额外校验。先把 `-wl` 打开，确认它请求的是哪个域名，
 再把域名补进 `common/common.go` 里的 `ProxyDomain` / `HostDomain` 表。
 
+**连着但一直不换源（歌还是试听）**
+
+最典型的是「客户端能连上、歌单封面都正常，唯独该换源的歌放不了」，日志里只有一串
+`Local Received request CONNECT interfacepc.music.163.com:443`、每 5 秒重复一次，
+却没有任何 `Transport:` 行。这通常不是音源问题，而是 **TLS 那一层根本没走通**：
+
+1. 客户端 ALPN 只提供 `h2`，MITM 若只声明 `http/1.1` 会被静默拒绝（已在本 fork 修复）；
+2. `-mtls` 现生成的自签 CA 没装进客户端信任库。
+
+具体排查步骤、日志前缀对照表和踩坑速查表见
+[**docs/troubleshooting.md**](docs/troubleshooting.md)。
+
 ## 本 fork 相对上游的改动
 
 | 方面 | 说明 |
@@ -307,6 +319,17 @@ gh workflow run auto_release.yml -f version=1.0.0      # 指定版本号
 MT7621 的那个包额外带两道检查：打包前先确认产物是 ELF32 小端、`e_machine` 是 MIPS，
 压完再用 `upx -t` 解一遍验壳，任何一道不对就整个 job 失败，避免发出一个上机跑不起来的包。
 Release 附带 `SHA256SUMS`，校验：`sha256sum -c SHA256SUMS --ignore-missing`。
+
+## 踩坑记录
+
+两条时间线的复盘，都是从真机上撞出来的，附现象原文和根因：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/troubleshooting.md](docs/troubleshooting.md) | 一次具体故障的复盘：新版 PC 端「连上了但不换源」——ALPN 只协商 `http/1.1`、MITM CA 不被信任 |
+| [docs/padavan-pitfalls.md](docs/padavan-pitfalls.md) | 整条集成链的坑：编译器、字节序、UPX、证书链、DNS 劫持、音源、Web 页面、固件打包，共 50 余条 |
+
+如果你在这个项目上遇到怪问题，先翻第二条的速查表（第 8 节）。
 
 ## 致谢
 
