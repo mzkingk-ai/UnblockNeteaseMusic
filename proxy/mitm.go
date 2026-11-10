@@ -132,8 +132,16 @@ const mitmMaxRetry = 2
 func handshakeWithRetry(c net.Conn, br *bufio.Reader, host string, cert *tls.Certificate) (net.Conn, error) {
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		// 只协商 HTTP/1.1：h2 会走二进制帧，这里没有解码器
-		NextProtos: []string{"http/1.1"},
+		// 必须同时协商 h2：新版客户端（Electron/Chromium 内核，含网易云
+		// PC 版）的 ClientHello 里只有 h2，不提供 http/1.1。只声明
+		// "http/1.1" 时 ALPN 无交集，Go 发 no_application_protocol(120)
+		// 警报后直接断开——客户端连隧道都不发请求，表现为每 5 秒重连一次、
+		// 日志里只有一串 CONNECT 而没有 Transport。
+		// 解码不是问题：下面 serveMitmHTTP 的 http.Server 没设 TLSConfig，
+		// Serve 会按 shouldConfigureHTTP2ForServe 自动注册 TLSNextProto["h2"]，
+		// conn.serve 见到 NegotiatedProtocol=="h2" 就把连接交给标准库 h2 协议栈，
+		// 握手仍然全部由这里完成。
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 	// 嗅探阶段已经 Peek 过的 ClientHello 还在 br 里，包一层照常可读
 	rc := &replayConn{Conn: &bufferedConn{Conn: c, r: br}, capture: true}
