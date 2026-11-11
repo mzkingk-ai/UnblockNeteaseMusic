@@ -326,10 +326,13 @@ Release 附带 `SHA256SUMS`，校验：`sha256sum -c SHA256SUMS --ignore-missing
 
 | 文档 | 内容 |
 |---|---|
+| [docs/notes.md](docs/notes.md) | 这个项目本身踩过的坑：ALPN/h2、MITM CA、证书重签、`ProxyDomain` 表、音源并发与超时，附速查表 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 一次具体故障的复盘：新版 PC 端「连上了但不换源」——ALPN 只协商 `http/1.1`、MITM CA 不被信任 |
-| [docs/padavan-pitfalls.md](docs/padavan-pitfalls.md) | 整条集成链的坑：编译器、字节序、UPX、证书链、DNS 劫持、音源、Web 页面、固件打包，共 50 余条 |
 
-如果你在这个项目上遇到怪问题，先翻第二条的速查表（第 8 节）。
+如果你在这个项目上遇到怪问题，先翻 `docs/notes.md` 的速查表（第 4 节）。
+
+把它集成进具体固件时的坑（交叉编译、upx、Web 页面、dnsmasq 劫持、刷机、CI）
+不在这里，见对应固件仓库，例如 padavan-4.4 的 `trunk/user/unblockneteasemusic/PADAVAN.md`。
 
 ## 致谢
 
