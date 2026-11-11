@@ -171,6 +171,12 @@ sudo systemctl enable --now unm
 
 两件事：域名指向、信任证书。
 
+> **iOS 暂不支持。** 新版 iOS 客户端已经改用加密的新版 API（`xeapi`，
+> 走 `interface3.music.163.com`），请求体是 x25519 ECDH + AES-GCM 加密封装的，
+> 本项目目前只认明文 `eapi` / `weapi`，解不开也就无从改写播放地址——
+> 表现是「能连上、封面正常，但该换源的歌仍然只有试听」。
+> 这一层需要单独实现，目前尚未做。Android、Windows、macOS、Linux 客户端不受影响。
+
 ### 1. 把域名指到服务端
 
 在跑程序的机器上听 DNS 的设备，只要让它把 `music.163.com` 解析到服务端 IP 就行。
@@ -196,7 +202,7 @@ Windows / macOS 装在本机也是同样道理，程序会自动改系统 hosts�
 
 | 平台 | 做法 |
 |---|---|
-| **iOS** | 把 `ca.crt` 传到手机（AirDrop、邮件附件、或临时放到 HTTP 服务上用 Safari 打开）→ 设置 → 已下载描述文件 → 安装 → 再进 设置 → 通用 → 关于本机 → 证书信任设置，把 `UnblockNeteaseMusic Root CA` 打开 |
+| **iOS** | 暂不支持（客户端走加密的 `xeapi` 接口，见本节开头说明）；装证书也不会生效 |
 | **Android** | 设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书，选 `ca.crt`。注意 Android 7 以后**应用默认不信任用户装的 CA**，若网易云仍不通，需要 root 后把证书装进系统区（`/system/etc/security/cacerts/`），或参考下面「常见问题」的替代方案 |
 | **Windows** | 双击 `ca.crt` → 安装证书 → 本地计算机 → 把证书放入下列存储 → 受信任的根证书颁发机构 |
 | **macOS** | 双击 `ca.crt` 加进「钥匙串访问」→ 系统 → 找到 `UnblockNeteaseMusic Root CA` → 显示简介 → 信任 → 始终信任 |
@@ -237,10 +243,10 @@ curl -k "https://music.163.com/api/search/get/web?csrf_token=&s=test&type=1&offs
 
 版本不对：用 release 里的 `linux-mipsle-softfloat`，不要自己用 go1.23+ 编（见下面硬约束）。
 
-**iOS 新版本死活连不上**
+**iOS 上的歌还是试听**
 
-新版客户端可能对接口域名做了额外校验。先把 `-wl` 打开，确认它请求的是哪个域名，
-再把域名补进 `common/common.go` 里的 `ProxyDomain` / `HostDomain` 表。
+预期之内。新版 iOS 客户端走加密的 `xeapi` 接口（`interface3.music.163.com`），
+本项目目前只解明文 `eapi` / `weapi`，暂时不支持。详见上面「客户端：怎么用」开头的说明。
 
 **连着但一直不换源（歌还是试听）**
 
@@ -264,7 +270,6 @@ curl -k "https://music.163.com/api/search/get/web?csrf_token=&s=test&type=1&offs
 | 音源 | 新增 `pyncmd`；酷我改走 PC 接口解析（`provider/kuwo/pcparse.go`） |
 | 路由与解锁链路 | 音质选档、翻唱阈值、证书失败不退出、eapi 容错、provider 初始化顺序等 |
 | 多源稳定性 | 修掉并发写 map 崩溃；pyncmd 改为并发竞速，不再被全局 5 秒响应头超时误杀 |
-| 自动发布 | 推送到 `master` 后，如果相比上一个 release 有新提交，自动构建 15 个平台产物并发布 |
 
 ### 路由器上的硬约束
 
@@ -278,47 +283,6 @@ curl -k "https://music.163.com/api/search/get/web?csrf_token=&s=test&type=1&offs
 GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0 \
   go1.22 build -trimpath -ldflags "-s -w" -o UnblockNeteaseMusic .
 ```
-
-## 测试
-
-测试文件**不放在包目录**里，统一收在 [`_testdata/tests/`](_testdata/tests/)。
-`_` 开头的目录会被 Go 工具链整个忽略，所以它们既不参与构建，也不进 `go test ./...`，
-不会干扰把这个仓库直接拉去编译固件的构建链。
-
-要跑测试：
-
-```sh
-./_testdata/tests/run.sh
-```
-
-脚本会把测试临时复制回各自的包目录，跑完自动删除。
-
-## 自动发布
-
-[`.github/workflows/auto_release.yml`](.github/workflows/auto_release.yml) 负责构建与发布：
-
-| 触发 | 行为 |
-|---|---|
-| 推送到 `master` | 若相比上一个 release 有新提交，构建全部平台并发布新版本；没有新提交则直接跳过 |
-| 手动运行（Actions 页面 *Run workflow* / `gh workflow run`） | 可选「强制发布」和「手动指定版本号」 |
-
-版本号在「上一个 release 的 tag」上递增 patch（找不到 release 时依次回退到本地 tag、
-上游 `cnsilvan/UnblockNeteaseMusic` 的最后一个 release、文件里的 `FALLBACK_BASE`）。
-所以正常情况下第一次运行会产出 `0.2.14`。想用别的号，手动运行并填 `version` 即可。
-
-手动运行：
-
-```sh
-gh workflow run auto_release.yml                       # 有新提交才发布
-gh workflow run auto_release.yml -f force=true         # 强制发一版
-gh workflow run auto_release.yml -f version=1.0.0      # 指定版本号
-```
-
-构建统一固定 go1.22（见上面的硬约束）。所有二进制在打包前用 `upx --lzma --best` 压缩
-（路由器 flash 小，能省不少空间），macOS 的除外——upx 会破坏 Mach-O 签名。
-MT7621 的那个包额外带两道检查：打包前先确认产物是 ELF32 小端、`e_machine` 是 MIPS，
-压完再用 `upx -t` 解一遍验壳，任何一道不对就整个 job 失败，避免发出一个上机跑不起来的包。
-Release 附带 `SHA256SUMS`，校验：`sha256sum -c SHA256SUMS --ignore-missing`。
 
 ## 踩坑记录
 
