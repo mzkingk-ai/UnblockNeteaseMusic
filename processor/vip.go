@@ -82,11 +82,19 @@ func processInterest(netease *Netease) bool {
 // patchVipInfo 把会员信息里的到期时间挪到 100 年后，并补齐等级字段。
 // 只改这几个字段、保留其它字段（客户端有些页面会读 iconUrl / vipCode 之类）。
 func patchVipInfo(netease *Netease) bool {
+	if netease.JsonBody == nil {
+		return false
+	}
 	data, ok := netease.JsonBody["data"].(common.MapType)
 	if !ok {
 		return false
 	}
-	now, _ := data["now"].(json.Number).Int64()
+	// front/vip/info 的 data 里没有 now 字段，直接 n.(json.Number).Int64()
+	// 会 panic（interface conversion: interface {} is nil）——这里必须用双返回值断言。
+	now := int64(0)
+	if n, ok := data["now"].(json.Number); ok {
+		now, _ = n.Int64()
+	}
 	if now <= 0 {
 		now = time.Now().UnixNano() / 1e6
 	}
@@ -119,6 +127,9 @@ func patchVipInfo(netease *Netease) bool {
 
 // clearAds 把广告接口的 ads/data 清空，客户端拿不到东西就不会渲染。
 func clearAds(netease *Netease) bool {
+	if netease.JsonBody == nil {
+		return false
+	}
 	modified := false
 	if _, ok := netease.JsonBody["ads"]; ok {
 		netease.JsonBody["ads"] = &common.MapType{}
@@ -140,6 +151,9 @@ func clearAds(netease *Netease) bool {
 
 // clearBanners 清掉横幅里的广告位（trp.rules 是新的投放描述，光看 adid 会漏）。
 func clearBanners(netease *Netease) bool {
+	if netease.JsonBody == nil {
+		return false
+	}
 	modified := false
 	if banners, ok := netease.JsonBody["banners"].(common.SliceType); ok && len(banners) > 0 {
 		netease.JsonBody["banners"] = make(common.SliceType, 0)
@@ -160,6 +174,9 @@ func clearBanners(netease *Netease) bool {
 // clearDelivery 把投放位（试听弹窗、续费卡片）清空。
 // 实测服务端自己也会返回 resourceData:null，说明 null 是客户端认的合法值。
 func clearDelivery(netease *Netease) bool {
+	if netease.JsonBody == nil {
+		return false
+	}
 	data, ok := netease.JsonBody["data"].(common.MapType)
 	if !ok {
 		return false
