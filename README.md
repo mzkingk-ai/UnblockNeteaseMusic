@@ -154,8 +154,10 @@ sudo systemctl enable --now unm
 | `-o` | `pyncmd:kuwo` | 音源，冒号分隔可写多个，按顺序尝试（`pyncmd` `kuwo` `kugou` `migu`） |
 | `-b` | 关 | 强制最高音质 |
 | `-e` | 关 | 把返回里的播放地址也替换掉（部分老客户端需要） |
-| `-ba` / `-bu` | 关 | 屏蔽广告请求 / 屏蔽版本更新提示 |
-| `-lv` / `-sef` | 关 | 解锁本地 VIP / 解锁音效 |
+| `-ba` | 关 | 去广告：清空 `/api/ad/*` 的广告位、首页横幅（`banners` 与投放串 `trp.rules`）、`/api/delivery/*` 的投放（试听弹窗、续费卡片） |
+| `-bu` | 关 | 屏蔽版本更新提示 |
+| `-lv` | 关 | 本地 VIP：把客户端收到的会员信息（`vip/info`）到期时间推到 100 年后、等级补到 7，只改客户端看到的状态，不动真实账号 |
+| `-sef` | 关 | 解锁音效 |
 | `-sl` | `0` | 搜索页展示其它平台结果的数量（0–3） |
 | `-ms` | `0.75` | 匹配阈值 0–1，低于它宁可不解锁，避免匹配到错歌 |
 | `-l` | 空 | 日志文件路径，不填只打印到终端 |
@@ -163,6 +165,7 @@ sudo systemctl enable --now unm
 | `-proxy` | 自动探测 | `pyncmd` 音源走的本机代理，如 `http://127.0.0.1:7890`；`none` 强制直连 |
 | `-mtls` | 关 | TLS 中间人监听地址，如 `0.0.0.0:5201`。只有客户端把本机当 HTTP/HTTPS 代理、走 `CONNECT` 隧道时才需要 |
 | `-mk` | `./mitm-ca.key` | 中间人 CA 私钥，自动生成，重启复用 |
+| `-tlsclients` | 空 | 不认 `mitm-ca` 的客户端 IP（逗号分隔）。这些客户端的 `CONNECT` 不走中间人，直接送 `-sp` 端口用 `server.crt`——PC 端通常信任 `*.music.163.com` 这张却不装 `mitm-ca`，靠这个分流。不填也行：握手报证书不被信任时会自动识别，代价是等两轮超时 |
 | `-insecure` | 关 | TLS 端口不加载证书、按明文服务（给那些直连 TLS 端口的客户端） |
 | `-learn` | 关 | 自动学习劫持 IP：从 `/proc/net/nf_conntrack` 发现局域网客户端连的网易接口 IP（客户端用 HTTPDNS 时和本机解析结果不同），用固定 SNI 验证证书确是 `*.music.163.com` 后补进 nft 集合。只在 nftset 劫持模式下有意义 |
 | `-qc` | `./qq.cookie` | QQ 音乐 cookie 文件 |

@@ -22,7 +22,11 @@ DNS 与请求改写、音源实现。每一条都附现象原文和根因，多�
 4. **接管一条客户端请求要四处同时对**：`ProxyDomain` 表里有这个域名、程序自己
    解析网易地址不能问本机、TLS 端口与 MITM 端口不冲突、客户端信任这张 CA。
    任一环没对上，表现都是「歌还是试听」。
-5. **失败大多是静默的**（见最后一节）。
+5. **`Path` 白名单外的接口，规则和日志都不会生效**。会员/广告/投放类接口都不在表里，
+   不先放行，`-lv`/`-ba` 打开了也什么都没发生，`-wl` 也看不到它们的响应。
+6. **换源成功与否要看字段，不看域名**：`fee=8`、`br` 变了、`freeTrialInfo=null` 才算，
+   pyncmd 返回的本来就是网易自己的 m7xx 地址。
+7. **失败大多是静默的**（见最后一节）。
 
 ---
 
@@ -189,6 +193,45 @@ mv: can't rename '/mnt/usb/.../server.crt.new': File exists
 ```sh
 openssl req -new -key server.key -out server.csr
 ```
+
+### 1.11 同一个「证书不被信任」，两条隧道要分开治
+
+服务里其实同时开了两个 TLS 后端：
+
+| 端口 | 证书 | 签发者 | 谁认 |
+|---|---|---|---|
+| `-sp 5211`（TLS 口） | `server.crt`（SAN: `music.163.com`, `*.music.163.com`, `interface.music.163.com`, `interface3.music.163.com`） | `ca.crt`（Root CA） | 装了 `ca.crt` 的客户端，以及**本来就信任它**的 PC 端 |
+| `-mtls 5221`（MITM） | 按 SNI 现场签发 | `mitm-ca.crt` | 装了 `mitm-ca.crt` 的手机 |
+
+命中 `ProxyDomain` 的 CONNECT 默认被送进 MITM。于是「装了 mitm-ca 的手机」正常，
+「没装 mitm-ca 的 PC」永远握不上——而 PC 那边恰好信任 `*.music.163.com` 这张，
+只是没人告诉它该走 5211。
+
+**表现**（都是静默的）：客户端把 ClientHello 发完、收到我们的服务端 flight，
+然后**一个字节都不再发**，既不回 alert 也不断开；一段时间后可能出现
+`mitm 握手 music.163.com 失败（已重试 2 次）：remote error: tls: unknown certificate`，
+更多时候只有 `read tcp 127.0.0.1:5221->…: i/o timeout`。
+
+**改法**：按客户端分流，而不是让用户重装证书。
+
+- 显式配置：`-tlsclients 192.168.1.225`（逗号分隔）。这些 IP 的隧道直接送 `-sp`。
+- 自动识别：握手报出证书不被信任时，记下这个客户端，1 小时内都送 `-sp`；
+  日志 `客户端 x.x.x.x 不认 mitm-ca，之后它的网易请求改走 5211（server.crt）`。
+
+**两个容易写错的点**
+
+1. 认出客户端必须用 `c.RemoteAddr()`。MITM 侧的 `LocalAddr()` 永远是
+   `127.0.0.1:5221` 那个监听口，用它做键永远匹配不上。客户端 IP 要靠
+   **拨号回来的源端口**反查：`proxyConnectLocalhost` 里
+   `upstream.LocalAddr().(*net.TCPAddr).Port` → 客户端 IP 存一张表（隧道结束即删）。
+2. 判定顺序：域名级降级（同域名连挂 3 次 → 3 分钟透传）**要先看客户端是否已判定
+   该走 TLS 口**，否则「证书被拒 → 切 5211」会被「域名降级 → 透传」抢先命中，
+   客户端又被踢回原样透传，看起来像修复没生效。
+   反过来，**别把「读超时」也算成「该切 5211」**：手机偶尔抖动会被误踢到不认
+   `server.crt` 的后端，反而更糟。只对「证书被拒」和「明确的对端挂断（EOF/reset）」
+   做自动切换，超时只按域名降级。
+
+---
 
 ## 2. DNS 与请求改写
 
@@ -423,6 +466,48 @@ QQ 的取址接口对**未开通绿钻的账号一律返回 `104003` / purl 为�
 
 ---
 
+### 3.14 双层 gzip：只剥一层 `Content-Encoding` 就永远换不了源
+
+**现象**：手机能连上、封面正常、`Transport:` 也有，但一首都不换源；`-wl` 下只有
+`player/url/v1 => null`，即 `netease.JsonBody == nil`，`tryMatch` 直接被跳过。
+
+**根因**：新版 player/url 的响应被压了**两层**。实测一条 iPhone 请求的字节链：
+
+```
+739B  gzip(Content-Encoding)  ->  704B  AES-ECB  ->  689B  gzip(接口自己压的)  ->  1104B  JSON
+```
+
+外层是 HTTP 的 `Content-Encoding`。客户端显式带了 `Accept-Encoding: gzip` 时，
+Go 的 `http.Client` **不会**自动解压（`Transport.DisableCompression` 的语义反过来），
+所以这层一直透传到我们手里。剥掉外层再 ECB 解密，得到的仍是 gzip 流，
+`utils.ParseJson` 返回 nil，后面所有改写都没了入口。
+
+**改法**（`processor/processor.go` RequestAfter）：解密前先 `isGzipBytes` 剥外层；
+ECB 之后如果还是 gzip 再剥一次，并记 `innerGzip=true`；回写时先压回一层再加密，
+同时删掉 `content-encoding`，保证客户端收到的报文结构和它平时收到的一致。
+
+诊断时把这几项一起打出来最好认（`-wl` 下）：
+`body undecodable(path) rawlen=739 gzip=true gzlen=689 gzhead=1f8b… ssid= sskey= ce=gzip`。
+
+### 3.15 「url 不为空、code 200、没有 freeTrialInfo」也可能只是 96k 降质
+
+**现象**：某些歌能播，但永远是 96kbps aac，解锁像是「只成功了一半」。
+
+**根因**：未开会员时接口并不总是返回 `freeTrialInfo`。实测 songId 38576323（春风十里）：
+
+```json
+{"fee":1,"payed":0,"code":200,"encodeType":"aac","br":96012,"level":"standard","freeTrialInfo":null,"url":"http://m8.music.126.net/…"}
+```
+
+`url` 有值、`freeTrialInfo` 是 null，但 `fee=1` + `payed=0` 说明这是降质兜底。
+原来的触发条件是 `data["url"] == nil || data["freeTrialInfo"] != nil`，正好漏掉这一类。
+
+**改法**：加 `isVipDowngraded(data)`——`fee ∈ {1,4}` 且 `payed != 1` 也算「该换源」。
+判定「换源成功没有」也别看域名（pyncmd 返回的就是网易自己的 m7xx 地址），
+要看 `fee=8 / br / freeTrialInfo=null` 这组字段。
+
+---
+
 ## 4.5 CONNECT 隧道里的两个「静默坑」（2026-11 实测）
 
 这两个都是**没有任何报错、只表现成客户端反复重连**的类型，排查时差点走偏。
@@ -461,10 +546,13 @@ QQ 的取址接口对**未开通绿钻的账号一律返回 `104003` / purl 为�
 | 问题 | 状态 |
 |---|---|
 | `handshakeWithRetry` 重试 1/2、2/2 连续两次 `bad record MAC` | 存在。同一条连接上连续两次同样错误，说明该次不是独立抖动。客户端会自动重连，暂接受 |
-| iOS 走 `xeapi` 加密接口 | 未做。只认老的明文 eapi 路径，iOS 新版可能整条链路拦不到 |
+| iOS 走 `xeapi` 加密接口 | **已解决（绕过）**。请求体仍解不开（x25519+HKDF+AES-GCM），但响应侧只用了公开的 `eapiKey` 做 AES-ECB、无 MAC 校验，所以改成「只解响应、只改响应、再 ECB 回写」。实测 `fee=1/br=96012/aac` → `fee=8/br=1676/flac` |
 | 安卓证书安装 | 没有真机记录，只有页面帮助文本 |
 | RSA vs ECDSA 签名耗时 | 只有源码注释（「RSA-2048 几百毫秒 / P-256 几毫秒」），没有毫秒级实测 |
 | 新版客户端是否还有别的加密路径 | 只在 PC 版验证过 `interfacepc`；移动端、TV 端没测 |
+| `/api/vipauth/app/auth/query` 的 `canUse:false` | 未处理。`resourceType` 的取值含义还没采全，乱改可能把「不能播」变成「播放报错」 |
+| `/api/vip-center-bff/quality/auth/info`（音质授权） | 未处理，结构还没采到 |
+| 不认 `mitm-ca` 的客户端要按 IP 配 `-tlsclients` | 自动识别要等两轮超时（约 16 秒）才生效，PC 换 IP 后要改配置 |
 
 ---
 
