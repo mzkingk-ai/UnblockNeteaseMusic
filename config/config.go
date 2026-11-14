@@ -35,8 +35,13 @@ var (
 	EnableLocalVip     = flag.Bool("lv", false, "enable local vip")
 	UnlockSoundEffects = flag.Bool("sef", false, "unlock SoundEffects")
 	QQCookieFile       = flag.String("qc", "./qq.cookie", "specify cookies file ,such as : \"qq.cookie\"")
-	LogWebTraffic      = flag.Bool("wl", false, "log request url and response")
-	MinScore           = flag.Float64("ms", 0.75, "minimum match score (0-1), lower results are rejected, such as : \"0.75\"")
+	// TlsClients 指定哪些客户端（IP，逗号分隔）不走 MITM，直接走 -sp 那个
+	// TLS 监听口。用途：某些客户端不认 -mtls 自己签的 CA（实测 Windows 端
+	// 收下 ServerHello 后一声不吭，握手超时），但它认 -c 那张 server.crt
+	// （Root CA 签的）。把它们指到 5211 就能继续解锁，不用重装证书。
+	TlsClients    = flag.String("tlsclients", "", "client ips that should use the tls port instead of mitm, separated by comma")
+	LogWebTraffic = flag.Bool("wl", false, "log request url and response")
+	MinScore      = flag.Float64("ms", 0.75, "minimum match score (0-1), lower results are rejected, such as : \"0.75\"")
 	// Proxy 指定 pyncmd 走的本机代理。留空则自动探测常见端口（7890 等），
 	// 探测到就用，探测不到就走直连。传 "none" 可强制禁用代理。
 	Proxy    = flag.String("proxy", "", "http proxy for pyncmd, such as : \"http://127.0.0.1:7890\", \"none\" to disable")

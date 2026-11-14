@@ -77,6 +77,7 @@ func main() {
 			if *config.Learn {
 				learn.Start(0)
 			}
+			proxy.InitTlsClients()
 			proxy.InitProxy()
 			<-exit
 			log.Println("exiting UnblockNeteaseMusic")

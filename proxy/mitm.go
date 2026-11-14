@@ -112,15 +112,21 @@ func handleMitmInbound(c net.Conn) {
 	tc, err := handshakeWithRetry(c, br, host, cert)
 	if err != nil {
 		log.Printf("mitm 握手 %s 失败（已重试 %d 次）：%v", host, mitmMaxRetry, err)
-		// 只有两类失败值得记仇：
-		//   1) 客户端明确不认证书（实测 PC 端回 unknown certificate）——立刻降级；
-		//   2) 客户端把服务端 flight 收下后一个字节都不再发（读超时）——攒够次数再降级。
-		// `bad record MAC`/EOF 这类是 MT7621 上的握手抖动（见 mitmMaxRetry 的注释），
-		// 客户端重连就能好，算进去只会误伤手机侧。
+		// 失败分两类处理：
+		//   1) 客户端明确不认证书（实测 Windows 端回 unknown certificate）——
+		//      认得出是谁就把它切到 TLS 口（5211 那张 server.crt 是它本来就
+		//      信任的），认不出才按域名降级；
+		//   2) 收下 flight 后不吭声/直接关连接——可能是同一个证书问题，也可能
+		//      是 MT7621 上的握手抖动，只按域名降级（累计三次才生效）。
+		// `bad record MAC` 这类抖动客户端重连就能好，不算进去，免得误伤手机侧。
 		switch {
 		case certRejected(err):
-			noteMitmFailureForce(host)
-		case isReadTimeout(err):
+			if ip := mitmPeerOf(c); ip != "" {
+				noteClientNeedsTls(ip)
+			} else {
+				noteMitmFailureForce(host)
+			}
+		case isReadTimeout(err) || isClientHangup(err):
 			noteMitmFailure(host)
 		}
 		return
@@ -216,6 +222,17 @@ func isReadTimeout(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "i/o timeout")
+}
+
+// isClientHangup 判断失败是不是「客户端收下 flight 后直接关连接」。
+// Chromium 不认证书时常见这种表现：不发 alert，直接 close。
+func isClientHangup(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return msg == "EOF" || strings.Contains(msg, "unexpected EOF") ||
+		strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
 }
 
 // noteMitmFailureForce 明确失败时立刻降级，不必等攒够次数。

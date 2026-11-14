@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,7 +159,9 @@ func (h *HttpHandler) serveTunnel(resp http.ResponseWriter, request *http.Reques
 	if _, ok := common.ProxyDomain[domain]; ok {
 		// 这个域名最近连着几次 MITM 都失败（多半是客户端不认我们签的证书），
 		// 先按原样透传把客户端救回来，别让它一直卡在握手超时上。
-		if mitmDisabled(domain) {
+		// 例外：已经认出「是这台客户端不认 mitm-ca」的，交给 proxyConnectLocalhost
+		// 改走 5211（它认 server.crt），仍然能解锁。
+		if mitmDisabled(domain) && !preferTlsBackend(clientIP(request)) && !isTlsClient(clientIP(request)) {
 			proxyConnect(resp, request)
 			return
 		}
@@ -355,6 +358,100 @@ func (h *HttpHandler) serveProxy(resp http.ResponseWriter, request *http.Request
 		return
 	}
 }
+
+// 实测：Windows/Electron 客户端不认我们 MITM 自己签的 mitm-ca（握手直接回
+// `remote error: tls: unknown certificate`，然后一个字节都不再发），但它本来就
+// 信任 5211 那张 server.crt（Root CA 签的）。所以这类客户端不必装新证书：把它
+// 的隧道整个转到 5211，由同一个 serveProxy 改写响应，换源照样生效。
+// 客户端身份在 MITM 侧只剩回环地址，这里用「拨号时的本地端口」把隧道和真正
+// 的客户端 IP 对上。
+var (
+	mitmPeerPort  sync.Map // int(本地端口) -> string(客户端 IP)
+	clientTlsPref sync.Map // string(客户端 IP) -> time.Time(过期时间)
+)
+
+const clientTlsPrefTTL = time.Hour
+
+// clientIP 从 RemoteAddr 里取客户端 IP。
+func clientIP(req *http.Request) string {
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return req.RemoteAddr
+	}
+	return host
+}
+
+// preferTlsBackend 这个客户端是不是应该走 5211（它不认 mitm-ca）。
+func preferTlsBackend(ip string) bool {
+	if v, ok := clientTlsPref.Load(ip); ok {
+		if until, ok := v.(time.Time); ok && time.Now().Before(until) {
+			return true
+		}
+		clientTlsPref.Delete(ip)
+	}
+	return false
+}
+
+// noteClientNeedsTls 记下「这个客户端不认 mitm-ca」，之后它的隧道改走 5211。
+func noteClientNeedsTls(ip string) {
+	if ip == "" || ip == "127.0.0.1" {
+		return
+	}
+	clientTlsPref.Store(ip, time.Now().Add(clientTlsPrefTTL))
+	log.Printf("客户端 %s 不认 mitm-ca，之后它的网易请求改走 5211（server.crt）", ip)
+}
+
+// mitmPeerOf 用 MITM 侧连接的本地端口反查客户端 IP。
+func mitmPeerOf(c net.Conn) string {
+	// 注意用 RemoteAddr：从 MITM 监听器看出去，对端端口才是
+	// proxyConnectLocalhost 拨号时那个本地端口（LocalAddr 永远是 5221）。
+	addr, ok := c.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return ""
+	}
+	if v, ok := mitmPeerPort.Load(addr.Port); ok {
+		if ip, ok := v.(string); ok {
+			return ip
+		}
+	}
+	return ""
+}
+
+// tlsClients 是 -tlsclients 指定的「别走 MITM、直接走 TLS 口」的客户端。
+var tlsClients sync.Map // string(客户端 IP) -> struct{}
+
+// InitTlsClients 解析 -tlsclients，须在 InitProxy 之前调用。
+func InitTlsClients() {
+	if *config.TlsClients == "" {
+		return
+	}
+	var names []string
+	for _, ip := range strings.Split(*config.TlsClients, ",") {
+		if ip = strings.TrimSpace(ip); ip == "" {
+			continue
+		}
+		tlsClients.Store(ip, struct{}{})
+		names = append(names, ip)
+	}
+	if len(names) > 0 {
+		log.Printf("这些客户端不走 MITM，直接用 TLS 口：%s", strings.Join(names, ", "))
+	}
+}
+
+// isTlsClient 这个客户端是否被 -tlsclients 指定走 TLS 口。
+func isTlsClient(ip string) bool {
+	_, ok := tlsClients.Load(ip)
+	return ok
+}
+
+// tlsBackendAddr 返回应该把隧道转到哪个口：MITM 或 TLS 口（-sp）。
+func tlsBackendAddr(ip string) (addr string, isMitm bool) {
+	if preferTlsBackend(ip) || isTlsClient(ip) {
+		return net.JoinHostPort("127.0.0.1", strconv.Itoa(*config.TLSPort)), false
+	}
+	return *config.MITMAddr, true
+}
+
 func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 	log.Printf("Local Received request %s %s %s\n",
 		req.Method,
@@ -393,12 +490,21 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 		}
 		go func() {
 			defer client.Close()
-			upstream, err := net.DialTimeout("tcp", *config.MITMAddr, 10*time.Second)
+			ip := clientIP(req)
+			target, isMitm := tlsBackendAddr(ip)
+			upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 			if err != nil {
 				log.Println("MITM 回环拨号失败：", err)
 				return
 			}
 			defer upstream.Close()
+			if isMitm {
+				// 记下「这条隧道是谁」：MITM 侧握手失败时靠它把客户端认出来
+				if la, ok := upstream.LocalAddr().(*net.TCPAddr); ok {
+					mitmPeerPort.Store(la.Port, ip)
+					defer mitmPeerPort.Delete(la.Port)
+				}
+			}
 			// 双向搬运：handleMitmInbound 负责嗅探与握手，无需知道目标
 			done := make(chan struct{}, 1)
 			go func() { io.Copy(upstream, src); done <- struct{}{} }()
