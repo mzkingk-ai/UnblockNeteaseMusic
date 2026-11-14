@@ -201,8 +201,19 @@ func Request(request *http.Request, remoteUrl string) (*http.Response, error) {
 	return network.Request(&clientRequest)
 }
 func RequestAfter(request *http.Request, response *http.Response, netease *Netease) {
+	// 会员 / 广告 / 投放 / 升级这些接口大多不在下面 Path 白名单里，
+	// 正常流程压根不会读它们的 body，也就没机会把响应结构录下来。
+	// -wl 时先偷看一份，落盘后再把 response.Body 原样还原。
+	if *config.LogWebTraffic && *config.LogFile != "" && isInterestPath(netease.Path) {
+		peekInterestBody(netease.Path, response)
+	}
 	pass := false
 	if _, ok := Path[netease.Path]; ok {
+		pass = true
+	}
+	// 会员/广告这些接口不在上面的白名单表里，-lv / -ba 打开时要单独放行，
+	// 否则请求体贴根本不会进处理流程，规则写了也不生效。
+	if !pass && patchablePath(netease.Path) {
 		pass = true
 	}
 	if pass && response.StatusCode == 200 {
@@ -325,6 +336,8 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 						info.(common.MapType)["banners"] = newInfo
 					}
 				}
+			} else if patchablePath(netease.Path) {
+				modified = processInterest(netease)
 			} else if !netease.Web && (code == "401" || code == "512") && strings.Contains(netease.Path, "manipulate") {
 				modified = tryCollect(netease, request)
 			} else if !netease.Web && (code == "401" || code == "512") && strings.EqualFold(netease.Path, "/api/song/like") {
@@ -408,6 +421,81 @@ func logResponse(netease *Netease) {
 		modifiedJson, _ := json.Marshal(jsonBody)
 		sep := "===================================\n"
 		log.Println(sep + reqUrl + " => \n" + string(modifiedJson) + "\n")
+	}
+}
+
+// peekInterestBody 读一份响应体、尽力解成 JSON 后落盘，再把 Body 还原。
+// 只用于 -wl 观察真实结构，不参与改写，失败也不影响转发。
+func peekInterestBody(path string, response *http.Response) {
+	if response.StatusCode != 200 || response.Body == nil {
+		return
+	}
+	body, err := ioutil.ReadAll(response.Body)
+	response.Body.Close()
+	response.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+	if err != nil || len(body) == 0 {
+		return
+	}
+	dec := body
+	if enc := response.Header.Get("Content-Encoding"); len(enc) > 0 &&
+		(strings.Contains(enc, "gzip") || strings.Contains(enc, "deflate")) {
+		if unzipped, e := utils.UnGzip(dec); e == nil {
+			dec = unzipped
+		}
+	}
+	if isGzipBytes(dec) {
+		if unzipped, e := utils.UnGzip(dec); e == nil {
+			dec = unzipped
+		}
+	}
+	if utils.ParseJson(dec) == nil {
+		if plain, ok := crypto.AesDecryptECB(dec, []byte(eApiKey)); ok {
+			dec = plain
+		}
+		if isGzipBytes(dec) {
+			if unzipped, e := utils.UnGzip(dec); e == nil {
+				dec = unzipped
+			}
+		}
+	}
+	dumpInterest(*config.LogFile, path, dec)
+}
+
+// isInterestPath 判断这个响应值不值得落盘分析（会员 / 广告 / 投放 / 升级）。
+func isInterestPath(path string) bool {
+	for _, kw := range []string{"/vip", "/ad/", "deliver", "/banner", "upgrade", "vipnewcenter", "/act/", "/linkshow"} {
+		if strings.Contains(path, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// dumpInterest 把解密后的 JSON 写到 <log>.json.<ms>.<path>.txt，只留最近 40 份。
+func dumpInterest(logFile, path string, body []byte) {
+	name := strings.NewReplacer("/", "_", "?", "_", "&", "_", "=", "_").Replace(strings.TrimPrefix(path, "/"))
+	if len(name) > 60 {
+		name = name[:60]
+	}
+	dump := fmt.Sprintf("%s.json.%d.%s.txt", logFile, time.Now().UnixNano()/1e6, name)
+	if err := ioutil.WriteFile(dump, body, 0o644); err != nil {
+		log.Printf("dump interest fail(%s): %v\n", path, err)
+		return
+	}
+	if len(body) > 0 {
+		log.Printf("dump interest(%s) %d bytes -> %s\n", path, len(body), filepath.Base(dump))
+	}
+	// 清理：同一个接口只在最近 3 份里保留，避免热门接口把冷门接口挤掉；
+	// 总量再设个 300 的上限兜底。
+	if old, _ := filepath.Glob(logFile + ".json.*." + name + ".txt"); len(old) > 3 {
+		for _, f := range old[:len(old)-3] {
+			_ = os.Remove(f)
+		}
+	}
+	if all, _ := filepath.Glob(logFile + ".json.*.txt"); len(all) > 300 {
+		for _, f := range all[:len(all)-300] {
+			_ = os.Remove(f)
+		}
 	}
 }
 
