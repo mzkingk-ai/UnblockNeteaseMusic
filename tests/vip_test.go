@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -231,4 +232,131 @@ func TestNoFlagsKeepsData(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
+}
+
+// TestDoubleGzipRoundTrip 覆盖「外层 gzip + AES-ECB + 内层 gzip」这条实测报文路径：
+// iPhone 的 player/url 就是 739B gzip -> 704B ECB -> 689B gzip -> 1104B JSON。
+// 解的时候少解一层，JsonBody 就是 nil，换源逻辑全线跳过；回写时少包一层，
+// 客户端会因为报文结构变了当成坏包。这里断言改写后的报文字节结构与原来一致。
+func TestDoubleGzipRoundTrip(t *testing.T) {
+	withFlags(t, true, false)
+	jsonBody := []byte(`{"code":200,"data":{"now":1700000000000,"redVipLevel":3,"musicPackage":{"vipCode":220,"expireTime":1700000000000}}}`)
+
+	inner, err := utils.Gzip(jsonBody)
+	if err != nil {
+		t.Fatalf("gzip inner: %v", err)
+	}
+	encrypted := crypto.AesEncryptECB(inner, []byte("e82ckenh8dichen8"))
+	outer, err := utils.Gzip(encrypted)
+	if err != nil {
+		t.Fatalf("gzip outer: %v", err)
+	}
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Encoding": []string{"gzip"}},
+		Body:       ioutil.NopCloser(bytes.NewBuffer(outer)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/eapi/music-vip-membership/client/vip/info", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/music-vip-membership/client/vip/info"})
+
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+		t.Fatalf("content-encoding 应该被删掉，实际 %q", ce)
+	}
+	out, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// 回写顺序和客户端平时收到的一致：先压内层 gzip，再整体 AES-ECB 加密。
+	dec, ok := crypto.AesDecryptECB(out, []byte("e82ckenh8dichen8"))
+	if !ok {
+		t.Fatalf("回写内容不是 AES-ECB 密文")
+	}
+	plain, err := utils.UnGzip(dec)
+	if err != nil {
+		t.Fatalf("回写内容里没有内层 gzip: %v", err)
+	}
+	body := utils.ParseJson(plain)
+	if body == nil {
+		t.Fatalf("回写内容解不出 JSON")
+	}
+	if got := num(t, mapOf(t, body, "data"), "redVipLevel"); got != 7 {
+		t.Fatalf("redVipLevel 没改写，got %d", got)
+	}
+}
+
+// TestBatchResponse 覆盖 /api/batch 这种「一个响应里打包多个子接口」的情况：
+// 续费页签读的是包里的 front/vip/info，广告位在包里另有子响应。
+func TestBatchResponse(t *testing.T) {
+	withFlags(t, true, true)
+	// 子响应都是明文 JSON，整体也不加密——这正是新版客户端的 batch 形态。
+	body := []byte(`{"code":200,` +
+		`"/api/music-vip-membership/front/vip/info":{"code":200,"data":{"redVipLevel":3,"musicPackage":{"vipCode":220,"expireTime":1700000000000}}},` +
+		`"/api/ad/loading/get":{"ads":[{"ad_id":"x"}]}}`)
+
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/eapi/batch", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/batch"})
+
+	out, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := utils.ParseJson(out)
+	if got == nil {
+		t.Fatalf("batch 响应被改坏，解不出 JSON: %x", out)
+	}
+	vip := mapOf(t, got, "/api/music-vip-membership/front/vip/info")
+	expire := num(t, mapOf(t, mapOf(t, vip, "data"), "musicPackage"), "expireTime")
+	if expire < farFuture {
+		t.Fatalf("批量子响应里的到期时间没被推远，got %d", expire)
+	}
+	if ad := mapOf(t, got, "/api/ad/loading/get"); len(ad) != 0 {
+		t.Fatalf("批次里的广告子响应没被清空: %v", ad)
+	}
+}
+
+// TestPlainBodyNotDecrypted 是给 AesDecryptECB 的回归测试：它只要长度是 16 的
+// 倍数就返回成功，明文 JSON 恰好撞上 16 的倍数时会被解成乱码。所以解码前必须
+// 先判断「本来就是 JSON」，不能无脑解密。
+func TestPlainBodyNotDecrypted(t *testing.T) {
+	withFlags(t, true, true)
+	body := []byte(`{"code":200,"data":{"a":"xxxx"}}`) // 32 字节，16 的倍数
+	if len(body)%16 != 0 {
+		t.Fatalf("测试前提不成立：body 长度 %d 不是 16 的倍数", len(body))
+	}
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/api/song/detail", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/song/detail"})
+
+	out, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("明文响应被改动了:\n want %s\n got  %s", body, out)
+	}
+}
+
+// TestClearAdsKeepsArrayShape 覆盖开屏广告：/api/ad/loading/get 的 ads 是数组，
+// 清空时必须还它一个空数组。换成空对象的话，按强类型解析的客户端会把整包
+// 当成坏数据，退回本地缓存的旧素材，开屏广告就还会弹。
+func TestClearAdsKeepsArrayShape(t *testing.T) {
+	withFlags(t, false, true)
+	body := []byte(`{"code":200,"ads":[{"ad_id":"x","imgs":["u"]}],"other":1}`)
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/eapi/ad/loading/get", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/ad/loading/get"})
+
+	out, _ := ioutil.ReadAll(resp.Body)
+	got := utils.ParseJson(out)
+	if got == nil {
+		t.Fatalf("响应被改坏: %s", out)
+	}
+	if _, ok := got["ads"].([]interface{}); !ok {
+		t.Fatalf("ads 应该还是数组，实际 %T: %v", got["ads"], got["ads"])
+	}
+	if len(got["ads"].([]interface{})) != 0 {
+		t.Fatalf("ads 没清空: %v", got["ads"])
+	}
 }
