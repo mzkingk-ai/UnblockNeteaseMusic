@@ -591,3 +591,28 @@ ECB 之后如果还是 gzip 再剥一次，并记 `innerGzip=true`；回写时�
 `familyVip.expireTime=0`（没开通过家庭会员）必须跳过，否则会凭空多出一个家庭会员。
 
 客户端本地会把会员状态缓存一份，改完服务端要杀掉 App 重开才会重新拉取。
+
+## processor / proxy 的文件划分
+
+`RequestAfter` 原先是一个两百多行的大 if-else，里面混着「解三层响应体」「取 JSON
+字段」「`/batch` 里分派子响应」「我自己的排错落盘」四件事，改一处容易碰坏另一处。
+现在按职责拆开，行为保持不变：
+
+| 文件 | 职责 |
+| --- | --- |
+| `processor/body.go` | 响应体编解码：`decodeBody` 判断外层 gzip / 内层 gzip / AES-ECB，`bodyCodec.encode` 按原样包回去 |
+| `processor/access.go` | 安全的 JSON 取值（`mapAt`/`numAt`/`strAt`…），取不到返回零值而不是 panic |
+| `processor/batch.go` | `/batch` 响应里按键分派子接口（会员状态、广告位、横幅、音效） |
+| `processor/song.go` | 换源：判断这首歌要不要换、去别的平台找、把结果写回 `data` |
+| `processor/vip.go` | 本地 VIP 与去广告的字段改写规则 |
+| `processor/debug.go` | `-wl` / `-wla` 的落盘（单份 512KB 上限，同名接口只留最近 3 份） |
+| `proxy/tunnel.go` | 两条 CONNECT 路径共用的接管与双向搬运 |
+| `tests/` | 黑盒用例，直接用 `processor.RequestAfter` 喂真实报文（样本在 `tests/testdata/`） |
+
+两条教训值得记着：
+
+1. **不要写单返回值的类型断言**。`data["id"].(json.Number)` 在字段缺失时会 panic，
+   而 panic 被 `proxy` 的 recover 兜住之后响应就写不回去了，客户端看到的是
+   「页面加载失败」，日志里只有一行 `Recover panic`——根因离现场很远。
+2. **先判断是不是明文再解密**。`AesDecryptECB` 只要长度是 16 的倍数就返回成功，
+   明文 JSON 恰好撞上这个长度时会被解成乱码，然后被当成坏包转发。
