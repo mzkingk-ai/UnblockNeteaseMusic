@@ -79,6 +79,10 @@ func InitProxy() {
 	startServer(fmt.Sprintf("%s:%d", *config.Addr, *config.Port), &HttpHandler{})
 }
 func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request) {
+	if *config.LogWebTraffic {
+		log.Printf("dbg http cli=%s method=%s host=%s url=%s proto=%s",
+			request.RemoteAddr, request.Method, request.Host, request.URL.RequestURI(), request.Proto)
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println("Recover panic : "+"\n"+string(debug.Stack()), r)
@@ -150,7 +154,14 @@ func (h *HttpHandler) serveTunnel(resp http.ResponseWriter, request *http.Reques
 	if len(request.URL.Host) > 0 {
 		hostStr = request.URL.Host
 	}
-	if _, ok := common.ProxyDomain[strings.TrimSuffix(hostStr, ":443")]; ok {
+	domain := strings.TrimSuffix(hostStr, ":443")
+	if _, ok := common.ProxyDomain[domain]; ok {
+		// 这个域名最近连着几次 MITM 都失败（多半是客户端不认我们签的证书），
+		// 先按原样透传把客户端救回来，别让它一直卡在握手超时上。
+		if mitmDisabled(domain) {
+			proxyConnect(resp, request)
+			return
+		}
 		proxyConnectLocalhost(resp, request)
 		return
 	}
@@ -353,18 +364,30 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 	hij, ok := rw.(http.Hijacker)
 	if !ok {
 		log.Println("HTTP Server does not support hijacking")
+		return
 	}
-	client, _, err := hij.Hijack()
+	client, buf, err := hij.Hijack()
 	if err != nil {
 		log.Println(err)
 		return
 	}
+	// Hijack 把连接交出来时，客户端「抢跑」发来的字节（Chrome/Electron
+	// 内核会在 CONNECT 之后立刻把 ClientHello 一起塞进来，不等我们的
+	// 响应）已经躺在 buf.Reader 里了。只搬 client 这个 net.Conn 会把这
+	// 部分字节丢掉：服务端等 ClientHello，客户端等服务端回话，双双卡死，
+	// 客户端每秒重连一次，日志里只有一串 CONNECT 而没有 Transport。
+	// 所以必须把 buf.Reader 一起带过去，响应也走 buf 并 Flush。
+	src := &bufferedConn{Conn: client, r: buf.Reader}
 	// 客户端把网易域名解析回本机时，隧道落在这里。配了 -mtls 就整条交给
 	// MITM：解密后复用 serveProxy 改写响应，这才是换源真正生效的位置。
 	// 原先这里是 tls.Dial 回环自己，既不解密也不改写，且 mips 上 Go TLS
 	// 会报 packet length too long，客户端表现为「连上了又被掐断」。
 	if len(*config.MITMAddr) > 0 {
-		if _, err := client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n")); err != nil {
+		if _, err := buf.WriteString("HTTP/1.0 200 Connection Established\r\n\r\n"); err != nil {
+			client.Close()
+			return
+		}
+		if err := buf.Flush(); err != nil {
 			client.Close()
 			return
 		}
@@ -378,7 +401,7 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 			defer upstream.Close()
 			// 双向搬运：handleMitmInbound 负责嗅探与握手，无需知道目标
 			done := make(chan struct{}, 1)
-			go func() { io.Copy(upstream, client); done <- struct{}{} }()
+			go func() { io.Copy(upstream, src); done <- struct{}{} }()
 			io.Copy(client, upstream)
 			<-done
 		}()
@@ -423,18 +446,23 @@ func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 	if !ok {
 		log.Println("HTTP Server does not support hijacking")
 	}
-	client, _, err := hij.Hijack()
+	client, buf, err := hij.Hijack()
 	if err != nil {
 		log.Println(err)
 		return
 	}
+	// 同上：Hijack 前已在 buf 里的字节必须一起搬走，否则抢跑的
+	// ClientHello 会丢，隧道永远空转。
+	src := &bufferedConn{Conn: client, r: buf.Reader}
 	server, err := net.DialTimeout("tcp", host, 15*time.Second)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
-	go io.Copy(server, client)
+	if _, err := buf.WriteString("HTTP/1.0 200 Connection Established\r\n\r\n"); err == nil {
+		_ = buf.Flush()
+	}
+	go io.Copy(server, src)
 	io.Copy(client, server)
 	defer client.Close()
 	defer server.Close()

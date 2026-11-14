@@ -94,12 +94,16 @@ func handleMitmInbound(c net.Conn) {
 		serveMitmHTTP(&bufferedConn{Conn: c, r: br}, "plain")
 		return
 	}
+	// 给 SNI 嗅探设上限：半截 ClientHello 会让连接永久卡住，
+	// 表现成「只有 CONNECT、没有后续日志」
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	host, err := sniffSNI(br)
 	if err != nil {
 		// 取不到 SNI 就没法签出客户端认的证书；直接关掉比握手失败更干净
 		log.Printf("mitm 取 SNI 失败：%v", err)
 		return
 	}
+	_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
 	cert, err := certForHost(host)
 	if err != nil {
 		log.Printf("mitm 签发 %s 证书失败：%v", host, err)
@@ -108,9 +112,92 @@ func handleMitmInbound(c net.Conn) {
 	tc, err := handshakeWithRetry(c, br, host, cert)
 	if err != nil {
 		log.Printf("mitm 握手 %s 失败（已重试 %d 次）：%v", host, mitmMaxRetry, err)
+		noteMitmFailure(host)
 		return
 	}
+	noteMitmSuccess(host)
+	if *config.LogWebTraffic {
+		if tlsConn, ok := tc.(*tls.Conn); ok {
+			st := tlsConn.ConnectionState()
+			log.Printf("dbg mitm ok host=%s client=%s proto=%q ver=%x",
+				host, c.RemoteAddr(), st.NegotiatedProtocol, st.Version)
+		}
+	}
 	serveMitmHTTP(tc, host)
+}
+
+// MITM 会让客户端做一次完整握手，客户端认不认我们签的证书直接决定成败。
+// 识别不了证书的客户端（例如没装 mitm-ca 的 PC 端）握手会停在 ServerHello
+// 之后不再说话，我们只能等到超时；这时客户端表现为「连不上网易云」。
+// 处理办法：连续失败到阈值就把这个域名临时降级成原样透传——先保证能用，
+// TTL 过后再让它试一次 MITM，装好证书就自动恢复换源。
+const (
+	mitmFailThreshold = 3
+	mitmFailTTL       = 3 * time.Minute
+)
+
+type mitmFailState struct {
+	mu    sync.Mutex
+	fails int
+	until time.Time
+}
+
+var mitmFails sync.Map // host -> *mitmFailState
+
+func mitmFailStateOf(host string) *mitmFailState {
+	if v, ok := mitmFails.Load(host); ok {
+		return v.(*mitmFailState)
+	}
+	v, _ := mitmFails.LoadOrStore(host, &mitmFailState{})
+	return v.(*mitmFailState)
+}
+
+// mitmDisabled 判断这个域名当前是否应该跳过 MITM（原样透传）。
+func mitmDisabled(host string) bool {
+	v, ok := mitmFails.Load(host)
+	if !ok {
+		return false
+	}
+	st := v.(*mitmFailState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.until.IsZero() {
+		return false
+	}
+	if time.Now().After(st.until) {
+		// TTL 到期：清零重来，给 MITM 一次机会
+		st.until = time.Time{}
+		st.fails = 0
+		return false
+	}
+	return true
+}
+
+func noteMitmSuccess(host string) {
+	if v, ok := mitmFails.Load(host); ok {
+		st := v.(*mitmFailState)
+		st.mu.Lock()
+		st.fails = 0
+		st.until = time.Time{}
+		st.mu.Unlock()
+	}
+}
+
+func noteMitmFailure(host string) {
+	st := mitmFailStateOf(host)
+	st.mu.Lock()
+	st.fails++
+	reached := false
+	if st.fails >= mitmFailThreshold && st.until.IsZero() {
+		st.until = time.Now().Add(mitmFailTTL)
+		reached = true
+	}
+	n := st.fails
+	st.mu.Unlock()
+	if reached {
+		log.Printf("mitm %s 连续失败 %d 次，接下来 %s 先按原样透传（客户端可能没装 mitm-ca 证书）",
+			host, n, mitmFailTTL)
+	}
 }
 
 // mitmMaxRetry 是同一条连接上因错乱而重试的次数上限。
@@ -154,6 +241,12 @@ func handshakeWithRetry(c net.Conn, br *bufio.Reader, host string, cert *tls.Cer
 			return tc, nil
 		}
 		if !retryableTLS(err) || attempt == mitmMaxRetry {
+			if *config.LogWebTraffic {
+				// -wl 下记下「客户端给了多少 / 我们回了多少」，用来区分
+				// 「我们的 ServerHello 没发出去」和「客户端收下但不说话」
+				log.Printf("dbg mitm hs-fail host=%s read=%d written=%d err=%v",
+					host, rc.read, rc.written, err)
+			}
 			return nil, err
 		}
 		log.Printf("mitm 握手 %s 失败，重试 %d/%d：%v", host, attempt+1, mitmMaxRetry, err)
@@ -171,6 +264,8 @@ func handshakeWithRetry(c net.Conn, br *bufio.Reader, host string, cert *tls.Cer
 // 新握手也照样能读到。
 type replayConn struct {
 	net.Conn
+	read      int64 // 临时排错：累计读到的字节数
+	written   int64 // 临时排错：累计写出的字节数
 	mu        sync.Mutex
 	pending   []byte // 待重放副本
 	capture   bool   // 为真时把读到的字节追加进 pending
@@ -196,6 +291,7 @@ func (r *replayConn) Read(p []byte) (int, error) {
 	capture := r.capture
 	r.mu.Unlock()
 	n, err := r.Conn.Read(p)
+	r.read += int64(n)
 	if n > 0 && capture {
 		r.mu.Lock()
 		if r.capture {
@@ -203,6 +299,12 @@ func (r *replayConn) Read(p []byte) (int, error) {
 		}
 		r.mu.Unlock()
 	}
+	return n, err
+}
+
+func (r *replayConn) Write(p []byte) (int, error) {
+	n, err := r.Conn.Write(p)
+	r.written += int64(n)
 	return n, err
 }
 

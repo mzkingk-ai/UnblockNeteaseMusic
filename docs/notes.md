@@ -423,6 +423,31 @@ QQ 的取址接口对**未开通绿钻的账号一律返回 `104003` / purl 为�
 
 ---
 
+## 4.5 CONNECT 隧道里的两个「静默坑」（2026-11 实测）
+
+这两个都是**没有任何报错、只表现成客户端反复重连**的类型，排查时差点走偏。
+
+1. **Hijack 之后不能只搬 net.Conn。**
+   `http.Hijacker.Hijack()` 返回 `(conn, bufio.ReadWriter)`。客户端如果「抢跑」——
+   CONNECT 之后不等我们的 200 响应就把 ClientHello 塞进来（Chrome/Electron 内核
+   会这样）——这批字节已经在 `bufio.Reader` 里了。只把 `conn` 交给转发协程，
+   这部分字节就永久丢失：服务端等 ClientHello、客户端等服务端回话，双方干等到
+   超时。现象是 `Received request CONNECT xxx:443` 之后什么都没有，客户端每秒重连。
+   另外响应也必须走 `buf` 再 `Flush()`，不能 `conn.Write` 直写。
+   `proxyConnectLocalhost` 和 `proxyConnect` 两条路径都有这个坑，已一并修掉。
+
+2. **客户端不认我们的证书时，握手会停在 ServerHello 之后。**
+   实测 PC 端（没装 `mitm-ca.crt`）把 1486 字节 ClientHello 发完、收到我们 1422
+   字节的服务端 flight 后**一个字节都不再发**，既不回 alert 也不断开，纯等。
+   服务端只能等到读超时，客户端表现成「连不上、一直在转」。
+   现在：握手读超时 8 秒（原来 30 秒），同一个域名连续失败 3 次就临时降级成
+   原样透传（3 分钟后自动再试一次），日志里会留一行
+   `mitm <host> 连续失败 3 次，接下来 3m0s 先按原样透传`。
+   判断依据很好认：失败时 `read=` 停在 ClientHello 长度、`written=` 是我们的
+   flight 长度（`-wl` 下会打 `dbg mitm hs-fail`）。
+
+---
+
 ## 5. 仍未解决的
 
 | 问题 | 状态 |
