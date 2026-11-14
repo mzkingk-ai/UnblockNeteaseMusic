@@ -458,84 +458,55 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 		req.Host,
 		req.RemoteAddr,
 	)
-	hij, ok := rw.(http.Hijacker)
-	if !ok {
-		log.Println("HTTP Server does not support hijacking")
-		return
-	}
-	client, buf, err := hij.Hijack()
+	client, src, err := hijackTunnel(rw)
 	if err != nil {
-		log.Println(err)
+		log.Println("接管 CONNECT 失败：", err)
 		return
 	}
-	// Hijack 把连接交出来时，客户端「抢跑」发来的字节（Chrome/Electron
-	// 内核会在 CONNECT 之后立刻把 ClientHello 一起塞进来，不等我们的
-	// 响应）已经躺在 buf.Reader 里了。只搬 client 这个 net.Conn 会把这
-	// 部分字节丢掉：服务端等 ClientHello，客户端等服务端回话，双双卡死，
-	// 客户端每秒重连一次，日志里只有一串 CONNECT 而没有 Transport。
-	// 所以必须把 buf.Reader 一起带过去，响应也走 buf 并 Flush。
-	src := &bufferedConn{Conn: client, r: buf.Reader}
+
 	// 客户端把网易域名解析回本机时，隧道落在这里。配了 -mtls 就整条交给
 	// MITM：解密后复用 serveProxy 改写响应，这才是换源真正生效的位置。
 	// 原先这里是 tls.Dial 回环自己，既不解密也不改写，且 mips 上 Go TLS
 	// 会报 packet length too long，客户端表现为「连上了又被掐断」。
-	if len(*config.MITMAddr) > 0 {
-		if _, err := buf.WriteString("HTTP/1.0 200 Connection Established\r\n\r\n"); err != nil {
+	if len(*config.MITMAddr) == 0 {
+		// 没配 MITM 时退化为原样直通。同一目标只提示一次：客户端每 5 秒
+		// 重连一次，逐条打印会把日志冲成只剩这几行。
+		if _, seen := localhostWarn.LoadOrStore(req.Host, true); !seen {
+			log.Printf("提示：%s 走本机回环但未启用 -mtls，将原样透传（换源不生效）", req.Host)
+		}
+		port := req.URL.Port()
+		if port == "" {
+			port = "443"
+		}
+		server, err := net.DialTimeout("tcp", "localhost:"+port, 15*time.Second)
+		if err != nil {
+			log.Println(err)
 			client.Close()
 			return
 		}
-		if err := buf.Flush(); err != nil {
-			client.Close()
-			return
-		}
-		go func() {
-			defer client.Close()
-			ip := clientIP(req)
-			target, isMitm := tlsBackendAddr(ip)
-			upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
-			if err != nil {
-				log.Println("MITM 回环拨号失败：", err)
-				return
-			}
-			defer upstream.Close()
-			if isMitm {
-				// 记下「这条隧道是谁」：MITM 侧握手失败时靠它把客户端认出来
-				if la, ok := upstream.LocalAddr().(*net.TCPAddr); ok {
-					mitmPeerPort.Store(la.Port, ip)
-					defer mitmPeerPort.Delete(la.Port)
-				}
-			}
-			// 双向搬运：handleMitmInbound 负责嗅探与握手，无需知道目标
-			done := make(chan struct{}, 1)
-			go func() { io.Copy(upstream, src); done <- struct{}{} }()
-			io.Copy(client, upstream)
-			<-done
-		}()
+		pipeBoth(client, src, server)
 		return
 	}
-	localUrl := "localhost:"
-	var server net.Conn
-	port := req.URL.Port()
-	// 没配 MITM 时退化为原样直通。同一目标只提示一次：客户端每 5 秒重连
-	// 一次，逐条打印会把日志冲成只剩这几行。
-	if _, seen := localhostWarn.LoadOrStore(req.Host, true); !seen {
-		log.Printf("提示：%s 走本机回环但未启用 -mtls，将原样透传（换源不生效）", req.Host)
-	}
-	if port == "" {
-		port = "443"
-	}
-	localUrl = localUrl + port
-	server, err = net.DialTimeout("tcp", localUrl, 15*time.Second)
+
+	ip := clientIP(req)
+	target, isMitm := tlsBackendAddr(ip)
+	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		log.Println(err)
+		log.Println("MITM 回环拨号失败：", err)
+		client.Close()
 		return
 	}
-	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
-	go io.Copy(server, client)
-	io.Copy(client, server)
-	defer client.Close()
-	defer server.Close()
+	if isMitm {
+		// 记下「这条隧道是谁」：MITM 侧握手失败时靠它把客户端认出来。
+		if la, ok := upstream.LocalAddr().(*net.TCPAddr); ok {
+			mitmPeerPort.Store(la.Port, ip)
+			defer mitmPeerPort.Delete(la.Port)
+		}
+	}
+	// 双向搬运：handleMitmInbound 负责嗅探与握手，无需知道目标。
+	pipeBoth(client, src, upstream)
 }
+
 func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 	log.Printf("Received request %s %s %s\n",
 		req.Method,
@@ -547,38 +518,22 @@ func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 		rw.Write([]byte("This is a http tunnel proxy, only CONNECT method is allowed."))
 		return
 	}
-	host := req.URL.Host
-	hij, ok := rw.(http.Hijacker)
-	if !ok {
-		log.Println("HTTP Server does not support hijacking")
-	}
-	client, buf, err := hij.Hijack()
+	client, src, err := hijackTunnel(rw)
 	if err != nil {
-		log.Println(err)
+		log.Println("接管 CONNECT 失败：", err)
 		return
 	}
-	// 同上：Hijack 前已在 buf 里的字节必须一起搬走，否则抢跑的
-	// ClientHello 会丢，隧道永远空转。
-	src := &bufferedConn{Conn: client, r: buf.Reader}
 	// 用 network 包那份「直接问公共 DNS」的 dialer：这条路径会替客户端拨各种
 	// 第三方域名，走路由器 dnsmasq 在并发高时会 i/o timeout（客户端看到「加载失败」）。
-	server, err := network.DialProxy(host, 15*time.Second)
+	server, err := network.DialProxy(req.URL.Host, 15*time.Second)
 	if err != nil {
 		log.Println(err)
+		client.Close()
 		return
 	}
-	if _, err := buf.WriteString("HTTP/1.0 200 Connection Established\r\n\r\n"); err == nil {
-		_ = buf.Flush()
-	}
-	go io.Copy(server, src)
-	io.Copy(client, server)
-	defer client.Close()
-	defer server.Close()
+	pipeBoth(client, src, server)
 }
 
-// isEmbeddedSourceUrl 判断 RequestURI 里是否内嵌了一个完整的音源直链。
-// 需要同时满足：有 scheme、有 host，且路径里出现过 /unblockmusic/<scheme>://。
-// 歌曲自身的 path（如 /song/media/outer/url/xxx.mp3）不会命中。
 func embeddedSourceUrl(requestURI string) (string, bool) {
 	idx := strings.Index(requestURI, "/unblockmusic/")
 	if idx < 0 {
