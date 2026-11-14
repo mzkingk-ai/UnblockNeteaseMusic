@@ -112,11 +112,15 @@ func handleMitmInbound(c net.Conn) {
 	tc, err := handshakeWithRetry(c, br, host, cert)
 	if err != nil {
 		log.Printf("mitm 握手 %s 失败（已重试 %d 次）：%v", host, mitmMaxRetry, err)
-		// 「unknown certificate / bad certificate」是明确信号：客户端不认我们签的
-		// 证书（实测 PC 端就是这么回的）。这种没必要再试三次，直接降级。
-		if certRejected(err) {
+		// 只有两类失败值得记仇：
+		//   1) 客户端明确不认证书（实测 PC 端回 unknown certificate）——立刻降级；
+		//   2) 客户端把服务端 flight 收下后一个字节都不再发（读超时）——攒够次数再降级。
+		// `bad record MAC`/EOF 这类是 MT7621 上的握手抖动（见 mitmMaxRetry 的注释），
+		// 客户端重连就能好，算进去只会误伤手机侧。
+		switch {
+		case certRejected(err):
 			noteMitmFailureForce(host)
-		} else {
+		case isReadTimeout(err):
 			noteMitmFailure(host)
 		}
 		return
@@ -201,6 +205,17 @@ func certRejected(err error) bool {
 		}
 	}
 	return false
+}
+
+// isReadTimeout 判断失败是不是「客户端收下 flight 后不再说话」。
+func isReadTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	return strings.Contains(err.Error(), "i/o timeout")
 }
 
 // noteMitmFailureForce 明确失败时立刻降级，不必等攒够次数。
