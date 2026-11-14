@@ -204,7 +204,8 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 	// 会员 / 广告 / 投放 / 升级这些接口大多不在下面 Path 白名单里，
 	// 正常流程压根不会读它们的 body，也就没机会把响应结构录下来。
 	// -wl 时先偷看一份，落盘后再把 response.Body 原样还原。
-	if *config.LogWebTraffic && *config.LogFile != "" && isInterestPath(netease.Path) {
+	if *config.LogWebTraffic && *config.LogFile != "" &&
+		(isInterestPath(netease.Path) || *config.LogAllResponses) {
 		peekInterestBody(netease.Path, response)
 	}
 	pass := false
@@ -434,6 +435,10 @@ func peekInterestBody(path string, response *http.Response) {
 	response.Body.Close()
 	response.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 	if err != nil || len(body) == 0 {
+		return
+	}
+	// -wla 会把所有响应都读一遍，单个 body 给个上限，别让媒体/大 JSON 撑爆 /tmp。
+	if len(body) > 512*1024 {
 		return
 	}
 	dec := body

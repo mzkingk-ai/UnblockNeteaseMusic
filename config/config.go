@@ -41,7 +41,11 @@ var (
 	// （Root CA 签的）。把它们指到 5211 就能继续解锁，不用重装证书。
 	TlsClients    = flag.String("tlsclients", "", "client ips that should use the tls port instead of mitm, separated by comma")
 	LogWebTraffic = flag.Bool("wl", false, "log request url and response")
-	MinScore      = flag.Float64("ms", 0.75, "minimum match score (0-1), lower results are rejected, such as : \"0.75\"")
+	// LogAllResponses 是排障用的：-wl 打开时默认只落盘会员/广告这类接口，
+	// 但某段文案的取值接口常常猜不到（比如用户资料类接口），
+	// 打开 -wla 就把所有 JSON 响应都落一份，用来反查数据来源。
+	LogAllResponses = flag.Bool("wla", false, "log every json response body (debug, needs -wl)")
+	MinScore        = flag.Float64("ms", 0.75, "minimum match score (0-1), lower results are rejected, such as : \"0.75\"")
 	// Proxy 指定 pyncmd 走的本机代理。留空则自动探测常见端口（7890 等），
 	// 探测到就用，探测不到就走直连。传 "none" 可强制禁用代理。
 	Proxy    = flag.String("proxy", "", "http proxy for pyncmd, such as : \"http://127.0.0.1:7890\", \"none\" to disable")

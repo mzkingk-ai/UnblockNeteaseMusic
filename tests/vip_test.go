@@ -222,6 +222,8 @@ func TestNoFlagsKeepsData(t *testing.T) {
 	raw := readTestdata(t, "music-vip-membership_client_vip_info.json")
 	body := runRequestAfter(t, "/api/music-vip-membership/client/vip/info", raw)
 	data := mapOf(t, body, "data")
+	// testdata 里的到期时间在导出时统一换成了固定的过去时间点（脱敏），
+	// 这里断言的就是「原样不动」。
 	if got := num(t, mapOf(t, data, "musicPackage"), "expireTime"); got != 1700000000000 {
 		t.Fatalf("开关关着时不该改数据，实际 expireTime=%d", got)
 	}
