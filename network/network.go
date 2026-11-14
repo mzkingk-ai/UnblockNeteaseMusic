@@ -2,6 +2,7 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 	"io"
@@ -21,13 +22,50 @@ var (
 	directClient *http.Client
 )
 
+// proxyResolver 给转发用的解析器另找出口。
+//
+// 起因：路由器上的 dnsmasq 跑在 ujail 里，手机把整机流量都塞进本代理后，
+// 上游域名解析全落在它头上，并发一高就开始
+//
+//	dial tcp: lookup api-one-wscn.awtmt.com on 127.0.0.1:53: i/o timeout
+//
+// 客户端看到的是一串「加载失败」。这里改成直接问公共 DNS，绕开队列。
+// 只影响本程序自己发起的出站连接；客户端仍按自己的 DNS 走。
+var proxyResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 3 * time.Second}
+		var lastErr error
+		for _, server := range []string{"223.5.5.5:53", "119.29.29.29:53"} {
+			c, err := d.DialContext(ctx, network, server)
+			if err == nil {
+				return c, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	},
+}
+
+// DialProxy 用同一份解析器拨号，供 CONNECT 隧道直通路径复用。
+var proxyDialer = &net.Dialer{
+	Timeout:   5 * time.Second,
+	KeepAlive: 60 * time.Second,
+	Resolver:  proxyResolver,
+}
+
+func DialProxy(addr string, timeout time.Duration) (net.Conn, error) {
+	d := *proxyDialer
+	if timeout > 0 {
+		d.Timeout = timeout
+	}
+	return d.Dial("tcp", addr)
+}
+
 func init() {
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 60 * time.Second,
-		}).DialContext,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           proxyDialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          300,
 		IdleConnTimeout:       90 * time.Second,

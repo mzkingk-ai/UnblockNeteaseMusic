@@ -446,6 +446,14 @@ QQ 的取址接口对**未开通绿钻的账号一律返回 `104003` / purl 为�
    判断依据很好认：失败时 `read=` 停在 ClientHello 长度、`written=` 是我们的
    flight 长度（`-wl` 下会打 `dbg mitm hs-fail`）。
 
+3. **出站解析别再依赖路由器的 dnsmasq。**
+   手机把整机流量塞进 5210 代理后，我们的每一次上游拨号都要解析域名，而路由器
+   的 dnsmasq 跑在 ujail 里，并发一高就
+   `dial tcp: lookup api-one-wscn.awtmt.com on 127.0.0.1:53: i/o timeout`，
+   客户端看到的是随机「加载失败」。现在 `network.proxyResolver` 直接问
+   223.5.5.5 / 119.29.29.29，`proxyConnect` 也改用同一个 `network.DialProxy`。
+   注意这只影响本程序自己发起的出站连接，客户端仍按自己的 DNS 走。
+
 ---
 
 ## 5. 仍未解决的

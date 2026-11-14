@@ -454,7 +454,9 @@ func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 	// 同上：Hijack 前已在 buf 里的字节必须一起搬走，否则抢跑的
 	// ClientHello 会丢，隧道永远空转。
 	src := &bufferedConn{Conn: client, r: buf.Reader}
-	server, err := net.DialTimeout("tcp", host, 15*time.Second)
+	// 用 network 包那份「直接问公共 DNS」的 dialer：这条路径会替客户端拨各种
+	// 第三方域名，走路由器 dnsmasq 在并发高时会 i/o timeout（客户端看到「加载失败」）。
+	server, err := network.DialProxy(host, 15*time.Second)
 	if err != nil {
 		log.Println(err)
 		return
