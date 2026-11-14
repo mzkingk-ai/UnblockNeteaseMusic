@@ -34,6 +34,18 @@ var (
 		"/api/delivery/batch-deliver",
 		"/api/delivery/cashier/alg/popup",
 	}
+	// /api/v1/user_info 是「我的」页和会员入口的共同数据源。它的字段名和
+	// vip/info 不一样：viptype=0 表示非会员，expiretime/backupExpireTime 是
+	// 上一次到期的时间戳。客户端就是拿 backupExpireTime 和现在比，算出
+	// 「已失去黑胶VIP特权 N 天」这句话（服务端从不下发这句话，所以抓包搜不到）。
+	// 客户端的写法不统一：PC 走 /api/v1/user_info，iOS 走 /api/v1/user/info，
+	// 冷启动还多一层 /api/page/cold/start/user/info/get（都带同样的字段）。
+	userInfoKeywords = []string{
+		"user/info",
+		"user_info",
+	}
+	// userInfoVipType 是非会员账号改成会员时写的类型值：11 = 黑胶VIP。
+	userInfoVipType = 11
 	// 会员到期时间往后推 100 年（毫秒）。
 	vipExtendMillis int64 = 3162240000000
 )
@@ -58,7 +70,7 @@ func pathHasPrefix(path string, list []string) bool {
 
 // patchablePath 判断这个接口在当前的开关下是否值得进处理流程。
 func patchablePath(path string) bool {
-	if *config.EnableLocalVip && isVipPath(path) {
+	if *config.EnableLocalVip && (isVipPath(path) || isUserInfoPath(path)) {
 		return true
 	}
 	if *config.BlockAds && (pathHasPrefix(path, adPathPrefixes) ||
@@ -71,6 +83,8 @@ func patchablePath(path string) bool {
 // processInterest 处理会员状态与广告/弹窗类响应。返回是否改写了响应。
 func processInterest(netease *Netease) bool {
 	switch {
+	case *config.EnableLocalVip && isUserInfoPath(netease.Path):
+		return patchUserInfo(netease)
 	case *config.EnableLocalVip && isVipPath(netease.Path):
 		return patchVipData(netease)
 	case *config.BlockAds && pathHasPrefix(netease.Path, adPathPrefixes):
@@ -333,3 +347,68 @@ func clearDelivery(netease *Netease) bool {
 	}
 	return modified
 }
+
+// isUserInfoPath 判断是不是「当前用户信息」类接口。
+func isUserInfoPath(path string) bool {
+	for _, kw := range userInfoKeywords {
+		if strings.Contains(path, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// patchUserInfo 把「我的」页拿到的账号状态改成会员。
+//
+// 字段不一定在顶层：冷启动那个 /page/cold/start/user/info/get 把它们包在
+// data 里，所以这里按 key 递归找，只认 viptype / expiretime / backupExpireTime
+// 这几个专有名字，不会误伤同一份报文里的其它字段。
+func patchUserInfo(netease *Netease) bool {
+	if netease.JsonBody == nil {
+		return false
+	}
+	if !patchUserInfoMap(netease.JsonBody) {
+		return false
+	}
+	log.Printf("localVIP has been triggered(%s).\n", netease.Path)
+	return true
+}
+
+func patchUserInfoMap(m map[string]interface{}) bool {
+	now := nowMillis()
+	modified := false
+	// 类型值只往上提，不往下压：真实会员（viptype 已经是正数）不动。
+	if n, ok := toInt(m["viptype"]); ok && n <= 0 {
+		m["viptype"] = json.Number(strconv.Itoa(userInfoVipType))
+		modified = true
+	}
+	// expiretime 是当前有效期，backupExpireTime 是上一次到期时间。两个都推到
+	// 100 年后，客户端才算「一直是会员」，不会去算「已失去 N 天」。
+	for _, key := range []string{"expiretime", "expireTime", "backupExpireTime"} {
+		v, ok := m[key]
+		if !ok {
+			continue
+		}
+		n, ok := toInt(v)
+		if !ok || n >= now+vipExtendMillis {
+			continue
+		}
+		m[key] = json.Number(strconv.FormatInt(now+vipExtendMillis, 10))
+		modified = true
+	}
+	for _, v := range m {
+		switch child := v.(type) {
+		case map[string]interface{}:
+			modified = patchUserInfoMap(child) || modified
+		case []interface{}:
+			for _, item := range child {
+				if sub, ok := item.(map[string]interface{}); ok {
+					modified = patchUserInfoMap(sub) || modified
+				}
+			}
+		}
+	}
+	return modified
+}
+
+func nowMillis() int64 { return time.Now().UnixNano() / 1e6 }

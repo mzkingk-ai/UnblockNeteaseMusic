@@ -360,3 +360,103 @@ func TestClearAdsKeepsArrayShape(t *testing.T) {
 		t.Fatalf("ads 没清空: %v", got["ads"])
 	}
 }
+
+// TestUserInfoVipPatch 覆盖 /api/v1/user_info：「我的」页和会员入口都读它，
+// 未开通账号返回 viptype=0、expiretime=0、backupExpireTime=上一次到期的
+// 时间戳，客户端用 backupExpireTime 和现在相减算出「已失去黑胶VIP特权 N 天」。
+func TestUserInfoVipPatch(t *testing.T) {
+	withFlags(t, true, false)
+	// 取自真机 dump，值已脱敏。
+	body := []byte(`{"level":8,"viptype":0,"expiretime":0,"backupExpireTime":1700000000000,` +
+		`"storeTitle":"商城","userPoint":{"balance":0,"userId":0},"code":200}`)
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/eapi/v1/user_info", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/v1/user_info"})
+
+	out, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := utils.ParseJson(out)
+	if got == nil {
+		t.Fatalf("响应被改坏: %s", out)
+	}
+	if vt := num(t, got, "viptype"); vt != 11 {
+		t.Fatalf("viptype 应该被改成黑胶VIP(11)，实际 %d", vt)
+	}
+	for _, key := range []string{"expiretime", "backupExpireTime"} {
+		if v := num(t, got, key); v < farFuture {
+			t.Fatalf("%s 没被推到 100 年后，got %d", key, v)
+		}
+	}
+	// 其它字段必须原样保留，客户端整包解析，少一个都可能判坏。
+	if got["storeTitle"] != "商城" {
+		t.Fatalf("storeTitle 被改动了: %v", got["storeTitle"])
+	}
+}
+
+// TestUserInfoRealMemberUntouched：真会员（viptype 已经是正数、到期时间在
+// 100 年内）只需要推时间，类型值不能被覆盖成别的。
+func TestUserInfoRealMemberUntouched(t *testing.T) {
+	withFlags(t, true, false)
+	body := []byte(`{"viptype":11,"expiretime":1700000000000,"backupExpireTime":1700000000000,"code":200}`)
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/api/v1/user_info", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/v1/user_info"})
+
+	out, _ := ioutil.ReadAll(resp.Body)
+	got := utils.ParseJson(out)
+	if num(t, got, "viptype") != 11 {
+		t.Fatalf("viptype 被改坏了: %v", got["viptype"])
+	}
+	if num(t, got, "expiretime") < farFuture {
+		t.Fatalf("到期时间没被推远")
+	}
+}
+
+// TestUserInfoIOSPath：iOS 用的是 /user/info（不是 /user_info），冷启动还有
+// /page/cold/start/user/info/get，三种写法都要命中。
+func TestUserInfoIOSPath(t *testing.T) {
+	withFlags(t, true, false)
+	for _, path := range []string{"/api/v1/user/info", "/api/page/cold/start/user/info/get"} {
+		body := []byte(`{"viptype":0,"expiretime":0,"backupExpireTime":1700000000000,"code":200}`)
+		resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+		req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/xeapi/v1/user/info", nil)
+		processor.RequestAfter(req, resp, &processor.Netease{Path: path})
+
+		out, _ := ioutil.ReadAll(resp.Body)
+		got := utils.ParseJson(out)
+		if got == nil {
+			t.Fatalf("%s: 响应被改坏: %s", path, out)
+		}
+		if num(t, got, "viptype") != 11 {
+			t.Fatalf("%s: viptype 没被改动: %v", path, got["viptype"])
+		}
+		if num(t, got, "backupExpireTime") < farFuture {
+			t.Fatalf("%s: backupExpireTime 没被推远", path)
+		}
+	}
+}
+
+// TestUserInfoNested 冷启动接口把用户信息包在 data 里，字段不在顶层。
+func TestUserInfoNested(t *testing.T) {
+	withFlags(t, true, false)
+	body := []byte(`{"code":200,"data":{"userType":null,"viptype":0,"expiretime":0,` +
+		`"backupExpireTime":1700000000000,"canRcmdStartPlay":0}}`)
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: ioutil.NopCloser(bytes.NewBuffer(body))}
+	req := httptest.NewRequest(http.MethodPost, "https://interface3.music.163.com/xeapi/page/cold/start/user/info/get", nil)
+	processor.RequestAfter(req, resp, &processor.Netease{Path: "/api/page/cold/start/user/info/get"})
+
+	out, _ := ioutil.ReadAll(resp.Body)
+	got := utils.ParseJson(out)
+	data := mapOf(t, got, "data")
+	if num(t, data, "viptype") != 11 {
+		t.Fatalf("嵌套的 viptype 没被改动: %v", data["viptype"])
+	}
+	if num(t, data, "backupExpireTime") < farFuture {
+		t.Fatalf("嵌套的 backupExpireTime 没被推远")
+	}
+	if _, ok := data["canRcmdStartPlay"]; !ok {
+		t.Fatalf("同层其它字段被弄丢了: %v", data)
+	}
+}
