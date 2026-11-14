@@ -1,12 +1,12 @@
 package qq
 
 import (
+	"github.com/mitchellh/mapstructure"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/config"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/network"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/provider/base"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
-	"github.com/mitchellh/mapstructure"
 	"log"
 	"math/rand"
 	"net/http"

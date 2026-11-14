@@ -6,10 +6,8 @@ import (
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/pool"
 )
 
-//
-//	Thanks to
-//	https://github.com/Levi233/MusicPlayer/blob/master/app/src/main/java/com/chenhao/musicplayer/utils/crypt/KuwoDES.java
-//
+// Thanks to
+// https://github.com/Levi233/MusicPlayer/blob/master/app/src/main/java/com/chenhao/musicplayer/utils/crypt/KuwoDES.java
 var (
 	SECRET_KEY = []byte("ylzsxkwm")
 	gArrayMask []*big.Int
@@ -186,7 +184,7 @@ func des64(subkeys []*big.Int, data *big.Int) *big.Int {
 	return new(big.Int).Set(out)
 }
 func Encrypt(src []byte) []byte {
-	by:=encrypt(src, SECRET_KEY)
+	by := encrypt(src, SECRET_KEY)
 	return by
 }
 
