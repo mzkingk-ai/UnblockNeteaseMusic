@@ -72,6 +72,10 @@ func (l *Learner) loop(interval time.Duration) {
 }
 
 func (l *Learner) once() {
+	// 先对账再学新 IP：sync_set.sh 每 60s 会 flush 整个集合、只重填 DNS 解析结果，
+	// 学到的 IP 会被一起清掉（实测 123.138.126.194 加上去不到一分钟就没了）。
+	// 如果只在「不在 known 里」时添加，被清掉的 IP 永远不会再补回来。
+	l.restore()
 	cands := l.candidates()
 	if len(cands) == 0 {
 		return
@@ -182,6 +186,40 @@ func (l *Learner) add(ip string) bool {
 	l.known[ip] = struct{}{}
 	l.mu.Unlock()
 	// nft 是原子操作，重复添加不会报错，但加上面那层判断可以少一次 fork。
+	return addElement(ip)
+}
+
+// restore 把「已知但集合里已经不存在」的 IP 补回去。
+func (l *Learner) restore() {
+	present := loadSet()
+	if present == nil {
+		// 集合不存在（或 nft 不可用）时不要动手，避免把已知表清空后无意义地重加。
+		return
+	}
+	l.mu.Lock()
+	missing := make([]string, 0, len(l.known))
+	for ip := range l.known {
+		if _, ok := present[ip]; !ok {
+			missing = append(missing, ip)
+		}
+	}
+	l.mu.Unlock()
+	if len(missing) == 0 {
+		return
+	}
+	added := 0
+	for _, ip := range missing {
+		if addElement(ip) {
+			added++
+		}
+	}
+	if added > 0 {
+		log.Printf("learn: set was flushed by sync_set, restored %d ip(s)\n", added)
+	}
+}
+
+// addElement 只写 nft，不动 known 表。
+func addElement(ip string) bool {
 	cmd := exec.Command("nft", "add", "element", "inet", "unm", set4, "{", ip, "}")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("learn: nft add %s fail: %v %s\n", ip, err, strings.TrimSpace(string(out)))

@@ -257,15 +257,30 @@ func (h *HttpHandler) serveProxy(resp http.ResponseWriter, request *http.Request
 		netease := processor.RequestBefore(request)
 		if netease == nil {
 			log.Println("Request Blocked:", urlString)
+			// 之前这里直接 return，客户端拿到的是「连接被断开」，网易云 App
+			// 会把它显示成「页面加载失败」。给一个正常的错误响应，App 才好按
+			// 自己的逻辑重试或降级。
+			resp.WriteHeader(http.StatusForbidden)
+			resp.Write([]byte(`{"code":403,"msg":"blocked"}`))
 			return
 		}
 		response, err := processor.Request(request, urlString)
 		if err != nil {
 			log.Println("Request error:", urlString)
+			// 同理：上游超时/失败时不能把连接悬着不响应，否则整页加载失败。
+			resp.WriteHeader(http.StatusBadGateway)
+			resp.Write([]byte(`{"code":502,"msg":"upstream error"}`))
 			return
 		}
 		defer response.Body.Close()
 		processor.RequestAfter(request, response, netease)
+		if *config.LogWebTraffic && strings.Contains(hostStr, "music.163.com") {
+			// -wl 下把每个网易请求的「客户端/状态/长度」打出来，定位
+			// 「有些页面打开就提示加载失败」到底是哪个接口回的什么。
+			log.Printf("dbg req cli=%s host=%s path=%s status=%d ce=%q cl=%q",
+				request.RemoteAddr, hostStr, path, response.StatusCode,
+				response.Header.Get("Content-Encoding"), response.Header.Get("Content-Length"))
+		}
 		for name, values := range response.Header {
 			resp.Header()[name] = values
 		}
