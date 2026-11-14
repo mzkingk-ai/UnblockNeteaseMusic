@@ -15,9 +15,13 @@ import (
 // -lv（本地 VIP）/ -ba（去广告）打开时把它们也纳入处理流程，
 // 否则客户端看到的一直是"未开通会员"的原始响应。
 var (
-	vipInfoPaths = []string{
-		"/api/music-vip-membership/client/vip/info",
-		"/api/music-vip-membership/front/vip/info",
+	// 会员状态不只出现在 vip/info 一个接口里：续费页签读的是
+	// vip-center-bff/float/data 里的 data.vipInfo，等级卡读的是
+	// vipnewcenter/.../growhpoint/basic 里的 data.userLevel，音质/权益卡读
+	// vip-center-bff/quality/auth/info。它们都是「带 vip 字样的接口」，
+	// 所以这里按路径关键字统一放行，再对响应做深度改写。
+	vipPathKeywords = []string{
+		"vip",
 	}
 	adPathPrefixes = []string{
 		"/api/ad/",
@@ -54,7 +58,7 @@ func pathHasPrefix(path string, list []string) bool {
 
 // patchablePath 判断这个接口在当前的开关下是否值得进处理流程。
 func patchablePath(path string) bool {
-	if *config.EnableLocalVip && pathIn(path, vipInfoPaths) {
+	if *config.EnableLocalVip && isVipPath(path) {
 		return true
 	}
 	if *config.BlockAds && (pathHasPrefix(path, adPathPrefixes) ||
@@ -67,8 +71,8 @@ func patchablePath(path string) bool {
 // processInterest 处理会员状态与广告/弹窗类响应。返回是否改写了响应。
 func processInterest(netease *Netease) bool {
 	switch {
-	case *config.EnableLocalVip && pathIn(netease.Path, vipInfoPaths):
-		return patchVipInfo(netease)
+	case *config.EnableLocalVip && isVipPath(netease.Path):
+		return patchVipData(netease)
 	case *config.BlockAds && pathHasPrefix(netease.Path, adPathPrefixes):
 		return clearAds(netease)
 	case *config.BlockAds && pathIn(netease.Path, bannerPaths):
@@ -79,50 +83,163 @@ func processInterest(netease *Netease) bool {
 	return false
 }
 
-// patchVipInfo 把会员信息里的到期时间挪到 100 年后，并补齐等级字段。
-// 只改这几个字段、保留其它字段（客户端有些页面会读 iconUrl / vipCode 之类）。
-func patchVipInfo(netease *Netease) bool {
+func isVipPath(path string) bool {
+	for _, kw := range vipPathKeywords {
+		if strings.Contains(path, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// patchVipData 对会员相关响应做深度改写。
+//
+// 为什么不再只改 vip/info：客户端判断「是不是会员」用的是好几个接口里的
+// expireTime，只要有一处还是过去的日期，页面就会显示「已失去黑胶VIP特权 41 天」。
+// 实测带 expireTime 的接口一共六类（vip/info 两版、vip-center-bff/float/data 里的
+// data.vipInfo、vip-center-bff/quality/auth/info 里的 data.vipInfo、
+// vipnewcenter/.../growhpoint/basic 里的 data.userLevel、vipauth/app/auth/query
+// 里的每条权益），所以这里顺着 JSON 树走一遍，见到会员结构就改。
+func patchVipData(netease *Netease) bool {
 	if netease.JsonBody == nil {
 		return false
 	}
-	data, ok := netease.JsonBody["data"].(common.MapType)
-	if !ok {
+	now := time.Now().UnixNano() / 1e6
+	if n, ok := netease.JsonBody["data"].(common.MapType); ok {
+		// client/vip/info 会带服务端时间，优先用它，避免设备时钟偏差。
+		if v, ok := n["now"].(json.Number); ok {
+			if ms, err := v.Int64(); err == nil && ms > 0 {
+				now = ms
+			}
+		}
+	}
+	if !patchVipNode("", netease.JsonBody, now) {
 		return false
 	}
-	// front/vip/info 的 data 里没有 now 字段，直接 n.(json.Number).Int64()
-	// 会 panic（interface conversion: interface {} is nil）——这里必须用双返回值断言。
-	now := int64(0)
-	if n, ok := data["now"].(json.Number); ok {
-		now, _ = n.Int64()
+	log.Println("localVIP has been triggered(" + netease.Path + ").")
+	return true
+}
+
+// 这些键下面挂的是「会员包」对象，到期时间一律往后推（包括从没开通过的 0）。
+var vipPackageKeys = []string{"musicPackage", "associator", "redVip", "vipPackage", "redplus", "vipInfo"}
+
+// patchVipNode 递归走 JSON 树，按结构特征识别会员数据并改写。
+func patchVipNode(key string, node interface{}, now int64) bool {
+	switch v := node.(type) {
+	case common.MapType:
+		return patchVipMap(key, v, now)
+	case *common.MapType:
+		if v == nil {
+			return false
+		}
+		return patchVipMap(key, *v, now)
+	case common.SliceType:
+		modified := false
+		for _, item := range v {
+			if patchVipNode(key, item, now) {
+				modified = true
+			}
+		}
+		return modified
 	}
-	if now <= 0 {
-		now = time.Now().UnixNano() / 1e6
-	}
-	expire := now + vipExtendMillis
+	return false
+}
+
+func patchVipMap(key string, m common.MapType, now int64) bool {
+	expire := json.Number(strconv.FormatInt(now+vipExtendMillis, 10))
 	modified := false
-	if _, ok := data["redVipLevel"]; ok {
-		data["redVipLevel"] = json.Number("7")
-		data["redVipAnnualCount"] = json.Number("1")
+
+	// 1) 会员包：musicPackage / associator / redVip / vipInfo ...
+	if pathIn(key, vipPackageKeys) {
+		if _, ok := m["expireTime"]; ok {
+			m["expireTime"] = expire
+			modified = true
+		}
+		if _, ok := m["isSign"]; ok {
+			m["isSign"] = false
+			modified = true
+		}
+		if lv, ok := toInt(m["vipLevel"]); ok && lv > 0 {
+			m["vipLevel"] = json.Number("7")
+			modified = true
+		}
+	}
+
+	// 2) 任何自带 vipCode 的对象（包括上面那些包，幂等）
+	if _, ok := m["vipCode"]; ok {
+		if old, ok := toInt(m["expireTime"]); ok && old > 0 && old < now {
+			m["expireTime"] = expire
+			modified = true
+		}
+	}
+
+	// 3) 黑胶等级字段（vip/info 里有，float/data 里也有）
+	if _, ok := m["redVipLevel"]; ok {
+		m["redVipLevel"] = json.Number("7")
 		modified = true
 	}
-	for _, key := range []string{"musicPackage", "associator", "redVip", "vipPackage"} {
-		pkg, ok := data[key].(common.MapType)
-		if !ok {
-			continue
-		}
-		pkg["expireTime"] = json.Number(strconv.FormatInt(expire, 10))
-		if _, ok := pkg["vipLevel"]; ok {
-			pkg["vipLevel"] = json.Number("7")
-		}
-		if _, ok := pkg["isSign"]; ok {
-			pkg["isSign"] = false
-		}
+	if _, ok := m["redVipAnnualCount"]; ok {
+		m["redVipAnnualCount"] = json.Number("1")
 		modified = true
 	}
-	if modified {
-		log.Println("localVIP has been triggered(" + netease.Path + ").")
+
+	// 4) 等级卡 userLevel：vipType 为负数表示「已过期」，latestVipStatus 0 同义
+	if _, ok := m["growthPoint"]; ok {
+		if _, ok := m["expireTime"]; ok {
+			m["expireTime"] = expire
+			modified = true
+		}
+		if old, ok := toInt(m["vipType"]); ok && old < 0 {
+			vipType := json.Number("100")
+			if latest, ok := toInt(m["latestVipType"]); ok && latest > 0 {
+				vipType = json.Number(strconv.FormatInt(latest, 10))
+			}
+			m["vipType"] = vipType
+			modified = true
+		}
+		if _, ok := m["latestVipStatus"]; ok {
+			m["latestVipStatus"] = json.Number("1")
+			modified = true
+		}
+	}
+
+	// 5) 权益清单（vipauth/app/auth/query）：canUse=false + 过去日期
+	if _, ok := m["resourceType"]; ok {
+		if canUse, ok := m["canUse"].(bool); ok && !canUse {
+			m["canUse"] = true
+			modified = true
+		}
+		if _, ok := m["canNotUseReasonCode"]; ok {
+			m["canNotUseReasonCode"] = json.Number("0")
+			modified = true
+		}
+		if old, ok := toInt(m["expireTime"]); ok && old < now {
+			m["expireTime"] = expire
+			modified = true
+		}
+	}
+
+	for k, v := range m {
+		if patchVipNode(k, v, now) {
+			modified = true
+		}
 	}
 	return modified
+}
+
+// toInt 把 JSON 里的数字字段读成 int64（ParseJson 用 UseNumber，所以是 json.Number）。
+func toInt(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	case float64:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // clearAds 把广告接口的 ads/data 清空，客户端拿不到东西就不会渲染。

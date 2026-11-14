@@ -569,3 +569,25 @@ ECB 之后如果还是 gzip 再剥一次，并记 `innerGzip=true`；回写时�
 所以这个项目的改动思路基本是同一个：**能报错就别静默**。
 `ContinueOnError`、MITM 启动时的警告、证书四档自检、代理探测结果写进日志——
 都是为了把「看起来正常但就是不换源」变成一句能 grep 到的话。
+
+## 本地 VIP 改写：会员状态散落在多个接口
+
+只改 `music-vip-membership/client/vip/info` 是不够的。实测把所有接口的 dump 扫一遍，
+带 `expireTime` 的只有六类：
+
+| 接口 | 位置 |
+| --- | --- |
+| `/api/music-vip-membership/client/vip/info` | `data.musicPackage.expireTime` |
+| `/api/music-vip-membership/front/vip/info` | 同上（`data` 里没有 `now`，别硬断言） |
+| `/api/vip-center-bff/float/data` | `data.vipInfo.musicPackage.expireTime` |
+| `/api/vip-center-bff/quality/auth/info` | `data.vipInfo.*.expireTime` |
+| `/api/vipnewcenter/app/level/growhpoint/basic` | `data.userLevel.expireTime`、`vipType`（负数=已过期） |
+| `/api/vipauth/app/auth/query` | 每条权益的 `canUse` / `expireTime` |
+
+任何一处留着过去的日期，会员中心就会显示「已失去黑胶VIP特权 N 天」
+（N 由客户端用 `now - expireTime` 算出来，服务端并不下发这句话，所以抓包搜不到）。
+因此 `processor/vip.go` 改成：路径里带 `vip` 就放行，然后顺着 JSON 树深度改写
+（会员包对象、`vipCode` 对象、`redVipLevel`、`userLevel`、权益清单）。
+`familyVip.expireTime=0`（没开通过家庭会员）必须跳过，否则会凭空多出一个家庭会员。
+
+客户端本地会把会员状态缓存一份，改完服务端要杀掉 App 重开才会重新拉取。
