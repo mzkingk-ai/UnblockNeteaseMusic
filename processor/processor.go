@@ -193,6 +193,7 @@ func Request(request *http.Request, remoteUrl string) (*http.Response, error) {
 	return network.Request(&clientRequest)
 }
 func RequestAfter(request *http.Request, response *http.Response, netease *Netease) {
+	probeContent(netease.Path, response)
 	// 会员 / 广告 / 投放 / 升级这些接口大多不在下面 Path 白名单里，
 	// 正常流程压根不会读它们的 body，也就没机会把响应结构录下来。
 	// -wl 时先偷看一份，落盘后再把 response.Body 原样还原。
