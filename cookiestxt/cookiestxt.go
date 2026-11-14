@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,7 +62,9 @@ func Parse(rd io.Reader) (cl []*http.Cookie, err error) {
 		var c *http.Cookie
 		c, err = ParseLine(scanner.Text())
 		if err != nil {
-			fmt.Errorf("cookiestxt line:%d, err:%s", line, err)
+			// 解析失败的行本来就被跳过，但要把它记下来，否则配置文件格式
+			// 写错时完全没有任何提示。
+			log.Printf("cookiestxt line:%d skipped: %v", line, err)
 			continue
 		}
 		cl = append(cl, c)
