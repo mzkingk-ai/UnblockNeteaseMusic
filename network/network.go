@@ -75,6 +75,17 @@ type ClientRequest struct {
 	// 用于「直连失败后改走本地代理再试一次」：不改环境变量（那会影响所有请求），
 	// 只对这一条请求生效。
 	HTTPProxy string
+	// TLSHandshakeTimeout 覆盖全局的 5s TLS 握手超时。
+	//
+	// 为什么需要：pyncmd 走 Cloudflare（music-api.gdstudio.xyz），实测路由器上
+	// 一次完整请求要 5~7s，TLS 握手本身就经常超过 5s，日志里表现为
+	//   http.Client.Do fail: ... net/http: TLS handshake timeout
+	// 连试两次都在握手上被截断，pyncmd 直接 give up，于是整首歌没有换源、
+	// 20s 窗口空转，客户端最后拿到的还是试听片段。
+	// 0 表示沿用全局默认（5s）。
+	TLSHandshakeTimeout time.Duration
+	// DialTimeout 覆盖全局的 5s 建连（含 DNS）超时。同样为慢接口准备。
+	DialTimeout time.Duration
 }
 
 func Request(clientRequest *ClientRequest) (*http.Response, error) {
@@ -201,11 +212,24 @@ func Request(clientRequest *ClientRequest) (*http.Response, error) {
 	// 换掉 Transport，不改全局配置 —— kuwo/kugou 等快音源仍按原超时/直连，
 	// 避免被慢接口或代理拖累。
 	// 两个覆盖项合并成一次 Clone：分两次写会互相覆盖（第二次拿的还是原 Transport）。
-	if clientRequest.ResponseHeaderTimeout > 0 || clientRequest.HTTPProxy != "" {
+	if clientRequest.ResponseHeaderTimeout > 0 || clientRequest.HTTPProxy != "" ||
+		clientRequest.TLSHandshakeTimeout > 0 || clientRequest.DialTimeout > 0 {
 		if tr, ok := client.Transport.(*http.Transport); ok {
 			t2 := tr.Clone()
 			if clientRequest.ResponseHeaderTimeout > 0 {
 				t2.ResponseHeaderTimeout = clientRequest.ResponseHeaderTimeout
+			}
+			if clientRequest.TLSHandshakeTimeout > 0 {
+				t2.TLSHandshakeTimeout = clientRequest.TLSHandshakeTimeout
+			}
+			if clientRequest.DialTimeout > 0 {
+				// DialContext 必须重新包一层：t2 是 tr 的克隆，改不了原来那个
+				// 已绑定的 DialContext 上的 Timeout，只能重建 Dialer。
+				dialTimeout := clientRequest.DialTimeout
+				t2.DialContext = (&net.Dialer{
+					Timeout:   dialTimeout,
+					KeepAlive: 60 * time.Second,
+				}).DialContext
 			}
 			if clientRequest.HTTPProxy != "" {
 				if pu, err := url.Parse(clientRequest.HTTPProxy); err == nil {

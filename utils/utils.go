@@ -52,6 +52,22 @@ func UnGzip(gzipData []byte) ([]byte, error) {
 	}
 	return decryptECBBytes, nil
 }
+
+// Gzip 把字节压成 gzip 流。回写网易响应时要保持「内层 gzip」的原样，
+// 客户端（含 iOS）会先解 gzip 再解析 JSON，报文结构变了它会当成坏包。
+func Gzip(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func LogInterface(i interface{}) string {
 	return fmt.Sprintf("%+v", i)
 }

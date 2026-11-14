@@ -16,6 +16,7 @@ import (
 	//_ "net/http/pprof" // 必须，引入 pprof 模块
 
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/host"
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/learn"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/proxy"
 )
 
@@ -71,6 +72,11 @@ func main() {
 			// 同步阻塞的 startServer()，放它后面 provider 表就永远是空的，
 			// 所有解锁请求都会静默返回空结果（实测消耗 6 秒超时后 code=404）。
 			provider.Init()
+			// 自动学习劫持 IP：必须在服务起监听之后才有意义（要先有客户端流量），
+			// 但它是后台 goroutine，放这里只是图个「启动即生效」，不阻塞监听。
+			if *config.Learn {
+				learn.Start(0)
+			}
 			proxy.InitProxy()
 			<-exit
 			log.Println("exiting UnblockNeteaseMusic")

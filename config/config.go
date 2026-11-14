@@ -48,6 +48,15 @@ var (
 	// MITMKeyFile 是自动生成 CA 时私钥落盘的位置，重启复用同一把 key，
 	// 客户端只需信任一次根证书。
 	MITMKeyFile = flag.String("mk", "./mitm-ca.key", "mitm ca private key file")
+	// Learn 打开「自动补全劫持 IP 集合」的开关。
+	//
+	// 背景：客户端（尤其 iOS 新版）解析 interface*.music.163.com 常常不走系统
+	// DNS 而是自带 HTTPDNS，拿到的节点 IP 和路由器解析出来的不是同一个。
+	// 路由器这边解析出 220.197.30.67 并放进 nft 集合，iPhone 却连
+	// 220.197.30.75 / 123.138.126.190，请求根本没进代理，于是「PC 能解锁、
+	// iPhone 还是试听」。开关打开后进程会从 conntrack 里发现这类漏网目标，
+	// 用固定 SNI 探一次证书确认是 *.music.163.com，再补进集合。
+	Learn = flag.Bool("learn", false, "auto-learn netease api ips from conntrack and add them to the nft set")
 )
 
 func ValidParams() bool {

@@ -12,9 +12,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/cache"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
@@ -211,6 +214,11 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 		}
 		body, _ := ioutil.ReadAll(response.Body)
 		response.Body.Close()
+		if *config.LogWebTraffic && strings.Contains(netease.Path, "player/url") {
+			log.Printf("dbg player/url status=%d bodylen=%d reqlen=%d te=%v ce=%q\n",
+				response.StatusCode, len(body), request.ContentLength,
+				request.TransferEncoding, response.Header.Get("Content-Encoding"))
+		}
 		tmpBody := make([]byte, len(body))
 		copy(tmpBody, body)
 		if len(body) > 0 {
@@ -222,12 +230,59 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 			if netease.Forward {
 				aeskey = linuxApiKey
 			}
+			// 响应可能被包了两层 gzip：
+			//   外层是 HTTP 的 Content-Encoding（客户端显式带了 Accept-Encoding: gzip
+			//   时 Go 不会自动解，所以我们自己解），内层是网易接口自己压的 JSON。
+			// 实测（iPhone，songId=38576323）：739 字节 gzip -> 704 字节 AES-ECB ->
+			// 689 字节 gzip -> 1104 字节 JSON。少解一层，JsonBody 就是 nil，
+			// tryMatch 拿不到任何东西，客户端只能播 96kbps 的降质地址。
+			if isGzipBytes(decryptECBBytes) {
+				if unzipped, err := utils.UnGzip(decryptECBBytes); err == nil {
+					decryptECBBytes = unzipped
+				}
+			}
 			result := utils.ParseJson(decryptECBBytes)
 			netease.Encrypted = false
+			innerGzip := false
 			if result == nil {
-				decryptECBBytes, encrypted := crypto.AesDecryptECB(decryptECBBytes, []byte(aeskey))
+				dec, encrypted := crypto.AesDecryptECB(decryptECBBytes, []byte(aeskey))
 				netease.Encrypted = encrypted
+				decryptECBBytes = dec
+				if isGzipBytes(decryptECBBytes) {
+					if unzipped, err := utils.UnGzip(decryptECBBytes); err == nil {
+						decryptECBBytes = unzipped
+						innerGzip = true
+					}
+				}
 				result = utils.ParseJson(decryptECBBytes)
+			}
+			// 解不出 JSON 时把「原始体长 + 头部字节」写进日志。
+			// 换源失败最常见的原因之一就是这里：上游回了个空 body（或者根本
+			// 不是 AES 密文），JsonBody 变成 nil，后面 tryMatch 什么也拿不到，
+			// 客户端只能试听——加这行是为了把「空」和「解不开」区分开。
+			if result == nil {
+				head := body
+				if len(head) > 16 {
+					head = head[:16]
+				}
+				dhead := decryptECBBytes
+				if len(dhead) > 16 {
+					dhead = dhead[:16]
+				}
+				// 落一份原始响应到 /tmp，方便拷回本机离线分析（只留最近 3 份）。
+				if *config.LogWebTraffic && *config.LogFile != "" {
+					dump := fmt.Sprintf("%s.raw.%d.bin", *config.LogFile, time.Now().Unix())
+					_ = ioutil.WriteFile(dump, body, 0o644)
+					if old, _ := filepath.Glob(*config.LogFile + ".raw.*.bin"); len(old) > 3 {
+						for _, f := range old[:len(old)-3] {
+							_ = os.Remove(f)
+						}
+					}
+				}
+				log.Printf("body undecodable(%s) rawlen=%d head=%x gzip=%v gzlen=%d gzhead=%x ssid=%q sskey=%q ce=%q\n",
+					netease.Path, len(body), head, enableGzip, len(decryptECBBytes), dhead,
+					response.Header.Get("X-Encr-Ssid"), response.Header.Get("X-Encr-Sskey"),
+					response.Header.Get("Content-Encoding"))
 			}
 			netease.JsonBody = result
 
@@ -290,6 +345,13 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 				// log.Println(netease)
 				if *config.LogWebTraffic {
 					log.Println("modified =>\n" + string(modifiedJson))
+				}
+				// 请求方的响应里内层本来是 gzip 的，回写时照样压一层，
+				// 保证客户端拿到的报文结构和它平时收到的一模一样。
+				if innerGzip {
+					if gz, err := utils.Gzip(modifiedJson); err == nil {
+						modifiedJson = gz
+					}
 				}
 				if netease.Encrypted {
 					modifiedJson = crypto.AesEncryptECB(modifiedJson, []byte(aeskey))
@@ -548,7 +610,12 @@ func searchGreySongs(data common.SliceType, netease *Netease) bool {
 }
 func searchGreySong(data common.MapType, netease *Netease) bool {
 	modified := false
-	if data["url"] == nil || data["freeTrialInfo"] != nil {
+	// 触发换源的条件，除了「没地址」「试听片段」，还要算上「VIP 歌曲降质」：
+	// 未开通会员时新版接口会返回 code=200 + 96kbps aac 的完整地址，
+	// freeTrialInfo 却是 null（实测 songId=38576323: fee=1 payed=0
+	// encodeType=aac br=96012 level=standard），只按 url==nil 判断会漏掉这一类，
+	// 表现就是「能播，但一直是标准/低音质」，用户仍然认为没解锁。
+	if data["url"] == nil || data["freeTrialInfo"] != nil || isVipDowngraded(data) {
 		data["flag"] = 0
 		songId := data["id"].(json.Number).String()
 		searchMusic := common.SearchMusic{Id: songId, Quality: netease.MusicQuality}
@@ -1037,4 +1104,27 @@ func tryAddOtherPlatformResult(netease *Netease) bool {
 
 	}
 	return modified
+}
+
+// isGzipBytes 判断一段字节是不是 gzip 流（1f 8b）。
+func isGzipBytes(b []byte) bool {
+	return len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b
+}
+
+// isVipDowngraded 判断这是不是「VIP 歌曲给了个降质地址」的情况。
+// fee=1 表示这首歌需要会员，payed=0 表示没付过钱；这种组合下接口仍然会返回
+// 一个 96kbps aac 的完整地址（网易的策略是让未付费用户能听但只能听低音质），
+// 所以不能只靠 url==nil 判断要不要换源。
+func isVipDowngraded(data common.MapType) bool {
+	fee, ok := data["fee"].(json.Number)
+	if !ok {
+		return false
+	}
+	if fee.String() != "1" && fee.String() != "4" {
+		return false
+	}
+	if payed, ok := data["payed"].(json.Number); ok && payed.String() == "1" {
+		return false
+	}
+	return true
 }

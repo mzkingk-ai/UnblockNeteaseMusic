@@ -164,6 +164,7 @@ sudo systemctl enable --now unm
 | `-mtls` | 关 | TLS 中间人监听地址，如 `0.0.0.0:5201`。只有客户端把本机当 HTTP/HTTPS 代理、走 `CONNECT` 隧道时才需要 |
 | `-mk` | `./mitm-ca.key` | 中间人 CA 私钥，自动生成，重启复用 |
 | `-insecure` | 关 | TLS 端口不加载证书、按明文服务（给那些直连 TLS 端口的客户端） |
+| `-learn` | 关 | 自动学习劫持 IP：从 `/proc/net/nf_conntrack` 发现局域网客户端连的网易接口 IP（客户端用 HTTPDNS 时和本机解析结果不同），用固定 SNI 验证证书确是 `*.music.163.com` 后补进 nft 集合。只在 nftset 劫持模式下有意义 |
 | `-qc` | `./qq.cookie` | QQ 音乐 cookie 文件 |
 | `-v` | — | 只打印版本信息后退出 |
 
@@ -171,11 +172,24 @@ sudo systemctl enable --now unm
 
 两件事：域名指向、信任证书。
 
-> **iOS 暂不支持。** 新版 iOS 客户端已经改用加密的新版 API（`xeapi`，
-> 走 `interface3.music.163.com`），请求体是 x25519 ECDH + AES-GCM 加密封装的，
-> 本项目目前只认明文 `eapi` / `weapi`，解不开也就无从改写播放地址——
-> 表现是「能连上、封面正常，但该换源的歌仍然只有试听」。
-> 这一层需要单独实现，目前尚未做。Android、Windows、macOS、Linux 客户端不受影响。
+> **iOS 已支持（响应侧改写方案）。** 新版客户端确实改用加密的新版 API（`xeapi`，
+> 走 `interface3.music.163.com`），**请求体**是 x25519 ECDH + AES-GCM 封装，
+> 本项目仍然解不开——但**不需要解**：播放地址在**响应**里，而响应只是
+> AES-ECB（密钥就是公开的 `eapiKey = e82ckenh8dichen8`）且没有 MAC，
+> 改完原样写回即可。实测 iPhone 16 换个歌完整播放、无损音质。
+>
+> 响应有两种包装，缺一个都表现为「能播但只有 96kbps / 只能试听」：
+>
+> 1. **双层 gzip**：`gzip( AES-ECB( gzip(JSON) ) )`。外层是 HTTP 的
+>    `Content-Encoding`（客户端显式带 `Accept-Encoding: gzip` 时 Go 的
+>    `http.Client` 不会自动解），内层是接口自己压的。只剥一层就永远拿不到 JSON。
+> 2. **VIP 降质**：未开通会员时接口不再返回 `freeTrialInfo`，而是直接给一个
+>    `code=200` + 96kbps aac 的完整地址（`fee=1`/`payed=0`/`encodeType=aac`）。
+>    只按「url 为空」判断要不要换源会漏掉这一类。
+>
+> 另外 iPhone 解析接口域名常走自带 HTTPDNS，拿到的节点 IP 和本机解析结果不同
+> （实测本机 `220.197.30.67`，手机 `220.197.30.75` / `123.138.126.190`），
+> 不在 nft 集合里就等于完全没被劫持——所以路由器上要开 `-learn`。
 
 ### 1. 把域名指到服务端
 
@@ -202,7 +216,7 @@ Windows / macOS 装在本机也是同样道理，程序会自动改系统 hosts�
 
 | 平台 | 做法 |
 |---|---|
-| **iOS** | 暂不支持（客户端走加密的 `xeapi` 接口，见本节开头说明）；装证书也不会生效 |
+| **iOS** | 用 Safari/微信把 `ca.crt` 发给手机 → 设置 → 已下载描述文件 → 安装；再到 设置 → 通用 → 关于本机 → 证书信任设置 → 打开 `UnblockNeteaseMusic Root CA` 的完全信任 |
 | **Android** | 设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书，选 `ca.crt`。注意 Android 7 以后**应用默认不信任用户装的 CA**，若网易云仍不通，需要 root 后把证书装进系统区（`/system/etc/security/cacerts/`），或参考下面「常见问题」的替代方案 |
 | **Windows** | 双击 `ca.crt` → 安装证书 → 本地计算机 → 把证书放入下列存储 → 受信任的根证书颁发机构 |
 | **macOS** | 双击 `ca.crt` 加进「钥匙串访问」→ 系统 → 找到 `UnblockNeteaseMusic Root CA` → 显示简介 → 信任 → 始终信任 |

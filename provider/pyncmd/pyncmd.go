@@ -45,7 +45,7 @@ const (
 	directTimeout = 20 * time.Second
 	// 503 是实测到的偶发失败（20 次里 1 次）。有代理时两档都试一遍（直连/代理
 	// 各一次），没代理时就只有直连这一个来源，重试一次兜网络抖动。
-	maxAttempts = 2
+	maxAttempts = 3
 )
 
 // brOf 把网易的码率请求映射成第三方 API 的 br 参数。
@@ -199,8 +199,13 @@ func fetch(apiUrl string, proxyAddr string, timeout time.Duration) (common.MapTy
 		// 全局的 ResponseHeaderTimeout 是 5s，对这个慢接口会把每次请求都截断，
 		// 必须显式放宽，否则会被全局 5s 截断。
 		ResponseHeaderTimeout: timeout,
-		HTTPProxy:             proxyAddr,
-		ForbiddenEncodeQuery:  true, // 查询串已编码好，别让 http 再编码一遍
+		// 同上：全局 5s 的 TLS 握手超时在 MT7621 上不够用。
+		// 实测 music-api.gdstudio.xyz（Cloudflare）握手 2~6s，5s 时约一半请求
+		// 在握手阶段就被截断，日志里是 net/http: TLS handshake timeout。
+		TLSHandshakeTimeout:  timeout,
+		DialTimeout:          timeout,
+		HTTPProxy:            proxyAddr,
+		ForbiddenEncodeQuery: true, // 查询串已编码好，别让 http 再编码一遍
 	}
 	resp, err := network.Request(&clientRequest)
 	if err != nil {
