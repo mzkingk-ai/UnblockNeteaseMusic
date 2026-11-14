@@ -12,12 +12,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/cache"
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/common"
@@ -219,11 +216,6 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 	}
 	if pass && response.StatusCode == 200 {
 
-		encode := response.Header.Get("Content-Encoding")
-		enableGzip := false
-		if len(encode) > 0 && (strings.Contains(encode, "gzip") || strings.Contains(encode, "deflate")) {
-			enableGzip = true
-		}
 		body, _ := ioutil.ReadAll(response.Body)
 		response.Body.Close()
 		if *config.LogWebTraffic && strings.Contains(netease.Path, "player/url") {
@@ -231,79 +223,34 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 				response.StatusCode, len(body), request.ContentLength,
 				request.TransferEncoding, response.Header.Get("Content-Encoding"))
 		}
-		tmpBody := make([]byte, len(body))
-		copy(tmpBody, body)
+		tmpBody := append([]byte(nil), body...)
 		if len(body) > 0 {
-			decryptECBBytes := body
-			if enableGzip {
-				decryptECBBytes, _ = utils.UnGzip(decryptECBBytes)
-			}
-			aeskey := eApiKey
+			aesKey := eApiKey
 			if netease.Forward {
-				aeskey = linuxApiKey
+				aesKey = linuxApiKey
 			}
-			// 响应可能被包了两层 gzip：
-			//   外层是 HTTP 的 Content-Encoding（客户端显式带了 Accept-Encoding: gzip
-			//   时 Go 不会自动解，所以我们自己解），内层是网易接口自己压的 JSON。
-			// 实测（iPhone，songId=38576323）：739 字节 gzip -> 704 字节 AES-ECB ->
-			// 689 字节 gzip -> 1104 字节 JSON。少解一层，JsonBody 就是 nil，
-			// tryMatch 拿不到任何东西，客户端只能播 96kbps 的降质地址。
-			if isGzipBytes(decryptECBBytes) {
-				if unzipped, err := utils.UnGzip(decryptECBBytes); err == nil {
-					decryptECBBytes = unzipped
-				}
-			}
-			result := utils.ParseJson(decryptECBBytes)
-			netease.Encrypted = false
-			innerGzip := false
+			// 响应最多叠三层（外层 gzip / 内层 gzip / AES-ECB），交给 bodyCodec。
+			plain, codec := decodeBody(body, response.Header.Get("Content-Encoding"), aesKey)
+			netease.Encrypted = codec.encrypted
+			result := utils.ParseJson(plain)
 			if result == nil {
-				dec, encrypted := crypto.AesDecryptECB(decryptECBBytes, []byte(aeskey))
-				netease.Encrypted = encrypted
-				decryptECBBytes = dec
-				if isGzipBytes(decryptECBBytes) {
-					if unzipped, err := utils.UnGzip(decryptECBBytes); err == nil {
-						decryptECBBytes = unzipped
-						innerGzip = true
-					}
-				}
-				result = utils.ParseJson(decryptECBBytes)
-			}
-			// 解不出 JSON 时把「原始体长 + 头部字节」写进日志。
-			// 换源失败最常见的原因之一就是这里：上游回了个空 body（或者根本
-			// 不是 AES 密文），JsonBody 变成 nil，后面 tryMatch 什么也拿不到，
-			// 客户端只能试听——加这行是为了把「空」和「解不开」区分开。
-			if result == nil {
-				head := body
-				if len(head) > 16 {
-					head = head[:16]
-				}
-				dhead := decryptECBBytes
-				if len(dhead) > 16 {
-					dhead = dhead[:16]
-				}
-				// 落一份原始响应到 /tmp，方便拷回本机离线分析（只留最近 3 份）。
-				if *config.LogWebTraffic && *config.LogFile != "" {
-					dump := fmt.Sprintf("%s.raw.%d.bin", *config.LogFile, time.Now().Unix())
-					_ = ioutil.WriteFile(dump, body, 0o644)
-					if old, _ := filepath.Glob(*config.LogFile + ".raw.*.bin"); len(old) > 3 {
-						for _, f := range old[:len(old)-3] {
-							_ = os.Remove(f)
-						}
-					}
-				}
+				// 解不出 JSON 时把「原始体长 + 头部字节」写进日志：换源失败最常见
+				// 的原因之一就是上游回了个空 body 或者根本不是密文，JsonBody 变
+				// nil 之后 tryMatch 什么都拿不到，客户端只能试听。留这行是为了
+				// 把「空」和「解不开」区分开。
 				log.Printf("body undecodable(%s) rawlen=%d head=%x gzip=%v gzlen=%d gzhead=%x ssid=%q sskey=%q ce=%q\n",
-					netease.Path, len(body), head, enableGzip, len(decryptECBBytes), dhead,
+					netease.Path, len(body), headOf(body), isGzipEncoding(response.Header.Get("Content-Encoding")),
+					len(plain), headOf(plain),
 					response.Header.Get("X-Encr-Ssid"), response.Header.Get("X-Encr-Sskey"),
 					response.Header.Get("Content-Encoding"))
+				if *config.LogWebTraffic {
+					dumpRaw(*config.LogFile, body)
+				}
 			}
 			netease.JsonBody = result
 
 			modified := false
-			codeN, ok := netease.JsonBody["code"].(json.Number)
-			code := "200"
-			if ok {
-				code = codeN.String()
-			}
+			code := codeAt(netease.JsonBody)
 
 			logResponse(netease)
 
@@ -313,30 +260,7 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 			} else if strings.Contains(netease.Path, "/usertool/sound/") {
 				modified = unblockSoundEffects(netease.JsonBody)
 			} else if strings.Contains(netease.Path, "/batch") {
-				modified = localVIP(netease)
-				for key, resp := range netease.JsonBody {
-					if strings.Contains(key, "/usertool/sound/") {
-						modified = unblockSoundEffects(resp.(map[string]interface{}))
-					} else if *config.BlockAds && strings.Contains(key, "api/ad/") {
-						log.Println("block Ad has been triggered(" + key + ").")
-						resp = &common.MapType{}
-						modified = true
-					} else if *config.BlockAds && strings.EqualFold(key, "/api/v2/banner/get") {
-						newInfo := make(common.SliceType, 0)
-						info := netease.JsonBody[key]
-						for _, data := range info.(common.MapType)["banners"].(common.SliceType) {
-							if banner, ok := data.(common.MapType); ok {
-								if banner["adid"] == nil {
-									newInfo = append(newInfo, banner)
-								} else {
-									log.Println("block banner Ad has been triggered.")
-									modified = true
-								}
-							}
-						}
-						info.(common.MapType)["banners"] = newInfo
-					}
-				}
+				modified = patchBatchResponse(netease)
 			} else if patchablePath(netease.Path) {
 				modified = processInterest(netease)
 			} else if !netease.Web && (code == "401" || code == "512") && strings.Contains(netease.Path, "manipulate") {
@@ -353,22 +277,15 @@ func RequestAfter(request *http.Request, response *http.Response, netease *Netea
 				response.Header.Del("transfer-encoding")
 				response.Header.Del("content-encoding")
 				response.Header.Del("content-length")
-				// netease.JsonBody = netease.JsonBody
-				// log.Println("NeedRepackage")
 				modifiedJson, _ := json.Marshal(netease.JsonBody)
-				// log.Println(netease)
 				if *config.LogWebTraffic {
 					log.Println("modified =>\n" + string(modifiedJson))
 				}
-				// 请求方的响应里内层本来是 gzip 的，回写时照样压一层，
-				// 保证客户端拿到的报文结构和它平时收到的一模一样。
-				if innerGzip {
-					if gz, err := utils.Gzip(modifiedJson); err == nil {
-						modifiedJson = gz
-					}
-				}
-				if netease.Encrypted {
-					modifiedJson = crypto.AesEncryptECB(modifiedJson, []byte(aeskey))
+				// 客户端收到的报文结构必须和它平时收到的一致，否则会被当成坏包。
+				if out, err := codec.encode(modifiedJson); err == nil {
+					modifiedJson = out
+				} else {
+					log.Printf("encode response fail(%s): %v\n", netease.Path, err)
 				}
 				response.Body = ioutil.NopCloser(bytes.NewBuffer(modifiedJson))
 			} else {
@@ -425,103 +342,6 @@ func logResponse(netease *Netease) {
 	}
 }
 
-// peekInterestBody 读一份响应体、尽力解成 JSON 后落盘，再把 Body 还原。
-// 只用于 -wl 观察真实结构，不参与改写，失败也不影响转发。
-func peekInterestBody(path string, response *http.Response) {
-	if response.StatusCode != 200 || response.Body == nil {
-		return
-	}
-	body, err := ioutil.ReadAll(response.Body)
-	response.Body.Close()
-	response.Body = ioutil.NopCloser(bytes.NewBuffer(body))
-	if err != nil || len(body) == 0 {
-		return
-	}
-	// -wla 会把所有响应都读一遍，单个 body 给个上限，别让媒体/大 JSON 撑爆 /tmp。
-	if len(body) > 512*1024 {
-		return
-	}
-	dec := body
-	if enc := response.Header.Get("Content-Encoding"); len(enc) > 0 &&
-		(strings.Contains(enc, "gzip") || strings.Contains(enc, "deflate")) {
-		if unzipped, e := utils.UnGzip(dec); e == nil {
-			dec = unzipped
-		}
-	}
-	if isGzipBytes(dec) {
-		if unzipped, e := utils.UnGzip(dec); e == nil {
-			dec = unzipped
-		}
-	}
-	if utils.ParseJson(dec) == nil {
-		if plain, ok := crypto.AesDecryptECB(dec, []byte(eApiKey)); ok {
-			dec = plain
-		}
-		if isGzipBytes(dec) {
-			if unzipped, e := utils.UnGzip(dec); e == nil {
-				dec = unzipped
-			}
-		}
-	}
-	dumpInterest(*config.LogFile, path, dec)
-}
-
-// isInterestPath 判断这个响应值不值得落盘分析（会员 / 广告 / 投放 / 升级）。
-func isInterestPath(path string) bool {
-	for _, kw := range []string{"/vip", "/ad/", "deliver", "/banner", "upgrade", "vipnewcenter", "/act/", "/linkshow"} {
-		if strings.Contains(path, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// dumpInterest 把解密后的 JSON 写到 <log>.json.<ms>.<path>.txt，只留最近 40 份。
-func dumpInterest(logFile, path string, body []byte) {
-	name := strings.NewReplacer("/", "_", "?", "_", "&", "_", "=", "_").Replace(strings.TrimPrefix(path, "/"))
-	if len(name) > 60 {
-		name = name[:60]
-	}
-	dump := fmt.Sprintf("%s.json.%d.%s.txt", logFile, time.Now().UnixNano()/1e6, name)
-	if err := ioutil.WriteFile(dump, body, 0o644); err != nil {
-		log.Printf("dump interest fail(%s): %v\n", path, err)
-		return
-	}
-	if len(body) > 0 {
-		log.Printf("dump interest(%s) %d bytes -> %s\n", path, len(body), filepath.Base(dump))
-	}
-	// 清理：同一个接口只在最近 3 份里保留，避免热门接口把冷门接口挤掉；
-	// 总量再设个 300 的上限兜底。
-	if old, _ := filepath.Glob(logFile + ".json.*." + name + ".txt"); len(old) > 3 {
-		for _, f := range old[:len(old)-3] {
-			_ = os.Remove(f)
-		}
-	}
-	if all, _ := filepath.Glob(logFile + ".json.*.txt"); len(all) > 300 {
-		for _, f := range all[:len(all)-300] {
-			_ = os.Remove(f)
-		}
-	}
-}
-
-func localVIP(netease *Netease) bool {
-	if !*config.EnableLocalVip {
-		return false
-	}
-	modified := false
-	if utils.Exist("/api/music-vip-membership/client/vip/info", netease.JsonBody) {
-		log.Println("localVIP has been triggered.")
-		modified = true
-		info := netease.JsonBody["/api/music-vip-membership/client/vip/info"]
-		expireTime, _ := info.(common.MapType)["data"].(common.MapType)["now"].(json.Number).Int64()
-		expireTime += 3162240000000
-		info.(common.MapType)["data"].(common.MapType)["redVipLevel"] = 7
-		info.(common.MapType)["data"].(common.MapType)["redVipAnnualCount"] = 1
-		info.(common.MapType)["data"].(common.MapType)["musicPackage"] = &common.MapType{"expireTime": expireTime, "vipCode": 230}
-		info.(common.MapType)["data"].(common.MapType)["associator"] = &common.MapType{"expireTime": expireTime}
-	}
-	return modified
-}
 func unblockSoundEffects(jsonBody map[string]interface{}) bool {
 	if !*config.UnlockSoundEffects {
 		return false
@@ -1200,9 +1020,6 @@ func tryAddOtherPlatformResult(netease *Netease) bool {
 }
 
 // isGzipBytes 判断一段字节是不是 gzip 流（1f 8b）。
-func isGzipBytes(b []byte) bool {
-	return len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b
-}
 
 // isVipDowngraded 判断这是不是「VIP 歌曲给了个降质地址」的情况。
 // fee=1 表示这首歌需要会员，payed=0 表示没付过钱；这种组合下接口仍然会返回

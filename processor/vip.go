@@ -248,8 +248,11 @@ func clearAds(netease *Netease) bool {
 		return false
 	}
 	modified := false
-	if _, ok := netease.JsonBody["ads"]; ok {
-		netease.JsonBody["ads"] = &common.MapType{}
+	if cur, ok := netease.JsonBody["ads"]; ok {
+		// 原来是什么形状就还它什么形状：/api/ad/loading/get 的 ads 是数组，
+		// 换成对象的话，按强类型解析的客户端（iOS/Swift）会整包当成坏的，
+		// 于是退回本地缓存的旧素材，开屏广告照样弹。
+		netease.JsonBody["ads"] = emptyLike(cur)
 		modified = true
 	}
 	if data, ok := netease.JsonBody["data"].(common.MapType); ok {
@@ -264,6 +267,17 @@ func clearAds(netease *Netease) bool {
 		log.Println("block Ad has been triggered(" + netease.Path + ").")
 	}
 	return modified
+}
+
+// emptyLike 返回和原值同类型的空容器（数组给空数组，对象给空对象）。
+func emptyLike(v interface{}) interface{} {
+	switch v.(type) {
+	case common.SliceType:
+		return make(common.SliceType, 0)
+	case common.MapType:
+		return common.MapType{}
+	}
+	return common.MapType{}
 }
 
 // clearBanners 清掉横幅里的广告位（trp.rules 是新的投放描述，光看 adid 会漏）。
