@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mzkingk-ai/UnblockNeteaseMusic/config"
@@ -98,57 +96,4 @@ func max(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// contentProbePaths 是「列表类」接口。它们不在改写白名单里，但客户端拿到空
-// 数据时会静默重试，光看日志分不清是上游空、我们改坏了还是根本没收到。
-var contentProbePaths = []string{
-	"playlist/square",
-	"playlist/highquality",
-	"playlist/catalogue",
-	"page/cold",
-}
-
-var contentProbeCount sync.Map // 路径 -> *int32
-
-// probeContent 把这类接口的状态码、长度和报文头部记一笔，每条路径最多记 3 次。
-func probeContent(path string, response *http.Response) {
-	hit := false
-	for _, p := range contentProbePaths {
-		if strings.Contains(path, p) {
-			hit = true
-			break
-		}
-	}
-	if !hit {
-		return
-	}
-	counter, _ := contentProbeCount.LoadOrStore(path, new(int32))
-	if n := atomic.AddInt32(counter.(*int32), 1); n > 3 {
-		return
-	}
-	body, err := ioutil.ReadAll(response.Body)
-	response.Body.Close()
-	if err == nil {
-		response.Body = ioutil.NopCloser(bytes.NewBuffer(body))
-	}
-	log.Printf("probe %s status=%d ce=%q cl=%d bodylen=%d head=%s\n",
-		path, response.StatusCode, response.Header.Get("Content-Encoding"),
-		response.ContentLength, len(body), headText(body, 96))
-}
-
-// headText 返回报文头部可打印的前 n 个字节。
-func headText(body []byte, n int) string {
-	if len(body) > n {
-		body = body[:n]
-	}
-	out := make([]byte, 0, len(body))
-	for _, b := range body {
-		if b >= 0x20 && b < 0x7f {
-			out = append(out, b)
-		} else {
-			out = append(out, '.')
-		}
-	}
-	return string(out)
 }
