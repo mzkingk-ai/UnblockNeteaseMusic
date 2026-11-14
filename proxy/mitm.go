@@ -112,7 +112,13 @@ func handleMitmInbound(c net.Conn) {
 	tc, err := handshakeWithRetry(c, br, host, cert)
 	if err != nil {
 		log.Printf("mitm 握手 %s 失败（已重试 %d 次）：%v", host, mitmMaxRetry, err)
-		noteMitmFailure(host)
+		// 「unknown certificate / bad certificate」是明确信号：客户端不认我们签的
+		// 证书（实测 PC 端就是这么回的）。这种没必要再试三次，直接降级。
+		if certRejected(err) {
+			noteMitmFailureForce(host)
+		} else {
+			noteMitmFailure(host)
+		}
 		return
 	}
 	noteMitmSuccess(host)
@@ -180,6 +186,36 @@ func noteMitmSuccess(host string) {
 		st.fails = 0
 		st.until = time.Time{}
 		st.mu.Unlock()
+	}
+}
+
+// certRejected 判断这次握手失败是不是「客户端不认证书」。
+func certRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{"unknown certificate", "bad certificate", "certificate unknown", "unknown ca"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// noteMitmFailureForce 明确失败时立刻降级，不必等攒够次数。
+func noteMitmFailureForce(host string) {
+	st := mitmFailStateOf(host)
+	st.mu.Lock()
+	already := !st.until.IsZero()
+	st.fails = mitmFailThreshold
+	if !already {
+		st.until = time.Now().Add(mitmFailTTL)
+	}
+	st.mu.Unlock()
+	if !already {
+		log.Printf("mitm %s 的证书被客户端拒绝，接下来 %s 先按原样透传（装上 mitm-ca.crt 即可恢复换源）",
+			host, mitmFailTTL)
 	}
 }
 
