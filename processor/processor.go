@@ -382,23 +382,16 @@ func tryCollect(netease *Netease, request *http.Request) bool {
 	modified := false
 	// log.Println(utils.ToJson(netease))
 	if utils.Exist("trackIds", netease.Params) {
-		trackId := ""
-		switch netease.Params["trackIds"].(type) {
-		case string:
-			var result common.SliceType
-			err := utils.ParseJsonV3(bytes.NewBufferString(netease.Params["trackIds"].(string)).Bytes(), &result)
-			if err == nil {
-				trackId = result[0].(string)
-			} else {
-				log.Println(err)
-				return false
-			}
-
-		case common.SliceType:
-			trackId = netease.Params["trackIds"].(common.SliceType)[0].(json.Number).String()
+		trackId, ok := firstTrackId(netease.Params["trackIds"])
+		if !ok {
+			log.Printf("tryCollect: trackIds 解析不出来: %v\n", netease.Params["trackIds"])
+			return false
 		}
-		pid := netease.Params["pid"].(string)
-		op := netease.Params["op"].(string)
+		pid, _ := strAt(netease.Params, "pid")
+		op, _ := strAt(netease.Params, "op")
+		if pid == "" || op == "" {
+			return false
+		}
 		proxyRemoteHost := common.HostDomain["music.163.com"]
 		clientRequest := network.ClientRequest{
 			Method:    http.MethodPost,
@@ -426,7 +419,7 @@ func tryLike(netease *Netease, request *http.Request) bool {
 	// log.Println("try like")
 	modified := false
 	if utils.Exist("trackId", netease.Params) {
-		trackId := netease.Params["trackId"].(string)
+		trackId, _ := strAt(netease.Params, "trackId")
 		proxyRemoteHost := common.HostDomain["music.163.com"]
 		clientRequest := network.ClientRequest{
 			Method:    http.MethodGet,
@@ -494,9 +487,11 @@ func tryMatch(netease *Netease) bool {
 		case common.SliceType:
 			if strings.Contains(netease.Path, "download") {
 				for index, data := range value.(common.SliceType) {
-					if index == 0 {
-						modified = searchGreySong(data.(common.MapType), netease) || modified
+					if index != 0 {
 						break
+					}
+					if item, ok := data.(map[string]interface{}); ok {
+						modified = searchGreySong(item, netease) || modified
 					}
 				}
 			} else {
@@ -530,7 +525,12 @@ func searchGreySong(data common.MapType, netease *Netease) bool {
 	// 表现就是「能播，但一直是标准/低音质」，用户仍然认为没解锁。
 	if data["url"] == nil || data["freeTrialInfo"] != nil || isVipDowngraded(data) {
 		data["flag"] = 0
-		songId := data["id"].(json.Number).String()
+		songId, ok := idOf(data)
+		if !ok {
+			// 没有 id 就没法去别的平台找，硬断言会 panic，然后整包响应写不回去。
+			log.Printf("player/url: 响应里没有可用的 id，跳过换源(%v)\n", data["id"])
+			return false
+		}
 		searchMusic := common.SearchMusic{Id: songId, Quality: netease.MusicQuality}
 		song := provider.Find(searchMusic)
 		haveSongMd5 := false

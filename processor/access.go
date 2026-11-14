@@ -2,7 +2,10 @@ package processor
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
+
+	"github.com/mzkingk-ai/UnblockNeteaseMusic/utils"
 )
 
 // 这一组是 JSON 取值的小工具。网易的响应字段时有时无、类型也不稳定，
@@ -79,4 +82,41 @@ func codeAt(m map[string]interface{}) string {
 		return s
 	}
 	return "200"
+}
+
+// firstTrackId 从 trackIds 参数里取第一首的 id。这个参数有两种形态：
+// JSON 数组（字符串）和已经解析好的数组，新老客户端发的都不一样。
+func firstTrackId(v interface{}) (string, bool) {
+	switch ids := v.(type) {
+	case string:
+		var list []string
+		if err := utils.ParseJsonV3([]byte(ids), &list); err == nil && len(list) > 0 {
+			return list[0], true
+		}
+		var raw []interface{}
+		if err := utils.ParseJsonV3([]byte(ids), &raw); err == nil && len(raw) > 0 {
+			return fmt.Sprint(raw[0]), true
+		}
+		return "", false
+	case []interface{}:
+		if len(ids) == 0 {
+			return "", false
+		}
+		if n, ok := ids[0].(json.Number); ok {
+			return n.String(), true
+		}
+		return fmt.Sprint(ids[0]), true
+	}
+	return "", false
+}
+
+// idOf 取歌曲 id，兼容 json.Number 和字符串两种写法。
+func idOf(m map[string]interface{}) (string, bool) {
+	if s, ok := strAt(m, "id"); ok && s != "" {
+		return s, true
+	}
+	if n, ok := numAt(m, "id"); ok {
+		return strconv.FormatInt(n, 10), true
+	}
+	return "", false
 }
